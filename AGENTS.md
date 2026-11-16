@@ -14,17 +14,20 @@
 | `docs/app/index.html` | The Margins app: page layout and styles (includes PostHog) |
 | `docs/app/margins.js` | App logic: manuscript drafts and version history, Story Bible, AI requests, the tabbed Suggestions panel, saving |
 | `docs/app/checker.js` | Free rule-based continuity checks (eye/hair colour, ages, name spellings, timeline slips) |
+| `server.py` | Local server: serves `docs/` at http://localhost:8000 and forwards AI requests (`POST /api/ask`) to OpenRouter using the key in `.env`. Python standard library only |
+| `.env.example` | Template for `.env`; the real `.env` holds `OPENROUTER_API_KEY` and is git-ignored |
 | `docs/*.png` | Screenshots used on the Product Page |
 | `prototype/index.html` | Original Build 1 prototype, kept for reference |
 | `Intent.md`, `Plan.md`, `journal/` | Planning notes |
 
 **How it works:** the author's text is checked by the rules in `checker.js` and, where AI is available, sent to an AI model with instructions to reply with structured findings that quote the exact words. The app drops any AI finding whose quote isn't in the text, merges in the rule findings, and shows them in the Suggestions panel. Approving a finding can record the correct fact in the Story Bible. Drafts and Story Bible changes are saved with a history.
 
-**Where AI runs:** the Claude-hosted version of the app uses Claude for the AI review and saves each author's work privately to their account. The public GitHub Pages version has no secret key (a key on a public page could be copied), so it runs the rule checks only and saves work in the browser. Next step: run the AI locally with an OpenRouter key kept in `.env` (see `.env.example`), never committed.
+**Where AI runs:** locally, `server.py` makes the AI call with the OpenRouter key from `.env` (model `openai/gpt-4o-mini`; measured cost about $0.00086 per review). The Claude-hosted version uses Claude. The public GitHub Pages version has no secret key (a key on a public page could be copied), so it runs the rule checks only and saves work in the browser.
 
 ## 2. Commands
-- **Install dependencies:** none.
-- **Run locally:** open `docs/app/index.html` in a browser, or run `cd docs && python3 -m http.server 8000` and open http://localhost:8000/app/ (Product Page at http://localhost:8000/).
+- **Install dependencies:** none. Needs Python 3 (on a Mac, accept the prompt to install the command line developer tools the first time).
+- **Set up the API key (once):** `cp .env.example .env`, then put your OpenRouter key after `OPENROUTER_API_KEY=` in `.env`. Never commit `.env`.
+- **Run locally:** `python3 server.py`, then open http://localhost:8000/app/ (Product Page at http://localhost:8000/). It should print `AI review: ON`. Press Control + C to stop. Without a key the app still runs with the rule checks only.
 - **Live:** Product Page https://building-with-ai-f26.github.io/margins/ · App https://building-with-ai-f26.github.io/margins/app/
 - **Run deterministic tests:** not yet (manual check: load the sample manuscript, run a continuity review, approve a finding, check History).
 - **Run model evals:** not yet (Build 4).
