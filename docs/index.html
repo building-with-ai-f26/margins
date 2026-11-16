@@ -165,7 +165,7 @@
     Authors add a manuscript, AI builds a Story Bible of characters and plotlines, and a continuity
     review returns suggestions the author approves or dismisses.<br />
     <strong>Demo:</strong> <a href="app/" onclick="window.posthog && posthog.capture('clicked_try_product', {from: 'showcase'})">Open the Margins app</a>.
-    The AI review runs in the Claude-hosted version of the app; this GitHub Pages version runs the free rule checks only.
+    The AI review runs when the app is run locally (<code>python3 server.py</code>, with the OpenRouter key kept in a private <code>.env</code> file) and in the Claude-hosted version. This public GitHub Pages version runs the free rule checks only, because an API key can't be kept secret on a public page.
   </p>
 
   <p class="meta">
@@ -200,6 +200,17 @@
     Margins never rewrites the author's text.
   </p>
   <img src="margins-build2-ai-suggestion.png" alt="An AI suggestion about Freya's hair length, with the two conflicting quotes highlighted in the manuscript" style="width:100%; height:auto; margin-bottom:20px; border:1px solid #e5e7eb; border-radius:8px;" />
+
+  <h3>4. The same review running locally with a real API call</h3>
+  <p>
+    Margins running on my laptop at <code>localhost:8000</code> with <code>python3 server.py</code>. The panel shows
+    "AI ready (openai/gpt-4o-mini)": the local server sends the excerpt to OpenRouter using the key stored in
+    <code>.env</code>, which is never uploaded to GitHub. The review of a 580-word excerpt ("Simple Smile")
+    returned 14 suggestions; I approved "Lily's Age", which recorded Lily's age (13) in the Story Bible.
+    The server logged the real cost of the call: 968 input + 1,192 output tokens, <strong>$0.00086</strong>, 15 seconds.
+  </p>
+  <img src="margins-build2-local-ai.png" alt="Margins running locally with AI ready (openai/gpt-4o-mini) and 14 suggestions, one approved" style="width:100%; height:auto; margin-bottom:20px; border:1px solid #e5e7eb; border-radius:8px;" />
+
 
   <h3>Build 1 Prototype Walkthrough</h3>
   <p>
@@ -258,8 +269,8 @@
 
       <h3>3. How It Works Under the Hood & Riskiest Assumption (Week 2+)</h3>
       <p><strong>Biggest Risk (PRD v2):</strong> The AI invents contradictions that aren't in the text, or flags so many minor or intentional choices (flashbacks, time passing) that authors stop trusting the suggestions.</p>
-      <p><strong>How Build 2 tests it:</strong> Every AI suggestion must quote the exact words from the manuscript. Margins checks each quote against the text and drops any suggestion whose quote can't be found, then highlights the real words so the author can judge in context. AI suggestions sit beside free rule-based checks, and the author approves or dismisses each one, so I can see how many AI suggestions are useful versus noise. In the first real test (a 1,470-word excerpt), the review returned 7 suggestions; the AI ones quoted real passages and flagged possible intentional changes as such.</p>
-      <p><strong>How the app works:</strong> The author pastes or uploads a manuscript (.docx or .txt) → saves it as a numbered draft → the app sends the text (and the author's Story Bible) to an AI model with instructions to return characters, plotlines or continuity issues as structured data with exact quotes → the app verifies the quotes, merges in rule-based checks, and shows a tabbed report → approving a suggestion can update the Story Bible, and every draft and Story Bible change is kept in a version history. In this build the AI model is Claude, used through the Claude-hosted version of the app, and each author's work is saved privately to their own account. The GitHub Pages version runs the rule checks only, because an AI key can't be kept secret on a public web page. Next step: run the AI locally with the API key kept in a <code>.env</code> file.</p>
+      <p><strong>How Build 2 tests it:</strong> Every AI suggestion must quote the exact words from the manuscript. Margins checks each quote against the text and drops any suggestion whose quote can't be found, then highlights the real words so the author can judge in context. AI suggestions sit beside free rule-based checks, and the author approves or dismisses each one, so I can see how many AI suggestions are useful versus noise. In the first real tests, a 1,470-word excerpt returned 7 suggestions and a 580-word excerpt returned 14. The AI suggestions quoted real passages, but some were not real contradictions (for example, "Lily's Age" only restated that Lily is 13). That confirms the risk: the next build needs a stricter prompt and a way to measure how many AI suggestions authors dismiss.</p>
+      <p><strong>How the app works:</strong> The author pastes or uploads a manuscript (.docx or .txt) → saves it as a numbered draft → the app sends the text (and the author's Story Bible) to an AI model with instructions to return characters, plotlines or continuity issues as structured data with exact quotes → the app verifies the quotes, merges in rule-based checks, and shows a tabbed report → approving a suggestion can update the Story Bible, and every draft and Story Bible change is kept in a version history. Run locally, the app talks to a small Python server (<code>server.py</code>) on the author's computer, which reads the OpenRouter API key from a private <code>.env</code> file and calls <code>openai/gpt-4o-mini</code>; the key never reaches the browser or GitHub. The Claude-hosted version uses Claude instead and saves each author's work privately to their account. The GitHub Pages version runs the rule checks only, because an AI key can't be kept secret on a public web page.</p>
 
       <h3>4. Unit Economics & Analytics Snapshot (Updated Weekly)</h3>
       <div class="grid-2">
@@ -269,7 +280,7 @@
         </div>
         <div class="stat-box">
           <div class="stat-label">Est. Cost Per User Run</div>
-          <div class="stat-value">~$0.001–$0.005 per AI review (estimate, small API model); rule checks $0</div>
+          <div class="stat-value">$0.00086 per AI review (measured: 580-word excerpt, gpt-4o-mini via OpenRouter); rule checks $0</div>
         </div>
         <div class="stat-box">
           <div class="stat-label">User Evidence (Analytics from Build 2)</div>
@@ -302,8 +313,8 @@
         <ul>
           <li><strong>What shipped:</strong> Rebuilt Margins as a working app with a real AI call: AI builds a Story Bible of characters and plotlines from the manuscript; a continuity review combines AI suggestions with rule-based checks; a tabbed Suggestions panel lets the author approve or dismiss each suggestion with the evidence highlighted in the text; version history saves each draft and Story Bible change with compare and restore. Published the app at <a href="app/">/app</a>, installed PostHog on this page and the app, and updated the PRD to v2.</li>
           <li><strong>Things learned with AI:</strong> How an app sends text to an AI model and gets structured results back, why API keys can't go on a public page, how to make the AI quote its evidence so its suggestions can be checked, and how to add analytics with PostHog.</li>
-          <li><strong>What broke / changed in PRD:</strong> Uploading files to GitHub through the website was confusing (the upload page doesn't accept folders), so I created the folder first and uploaded the files into it. The PRD moved from a single rule-based check to an AI-assisted review with a Story Bible, version history and author approval. The AI only runs in the Claude-hosted version for now; running it locally with a key in <code>.env</code> is the next step.</li>
-          <li><strong>Cost & time this week:</strong> About 5 hours. No extra spend beyond existing ChatGPT and Claude subscriptions; $0 in API charges this week.</li>
+          <li><strong>What broke / changed in PRD:</strong> Uploading files to GitHub through the website was confusing (the upload page doesn't accept folders), so I created the folder first and uploaded the files into it. The PRD moved from a single rule-based check to an AI-assisted review with a Story Bible, version history and author approval. Running the AI locally needed Apple's command line developer tools installed before <code>python3</code> would run, and the first local run printed errors from a small logging bug in <code>server.py</code> (fixed). Some AI suggestions were noise, which is the biggest risk in the PRD.</li>
+          <li><strong>Cost & time this week:</strong> About 5 hours. Existing ChatGPT and Claude subscriptions, plus $5 of OpenRouter credit (key capped at $2). Measured API cost: $0.00086 per AI review.</li>
         </ul>
       </div>
 
