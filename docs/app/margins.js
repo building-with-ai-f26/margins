@@ -14,6 +14,7 @@ const clone = (o) => JSON.parse(JSON.stringify(o));
 const AI_LIMIT = 60000; // characters sent to the AI per run (~10,000 words)
 const CATS = [['characters', 'Characters'], ['plotlines', 'Plotlines'], ['timeline', 'Timeline'], ['details', 'Details & names']];
 
+const track = (ev, props) => { try { if (window.posthog && window.posthog.capture) window.posthog.capture(ev, props || {}); } catch (_) {} };
 let toastTimer;
 function toast(msg) {
   const t = $('#toast'); t.textContent = msg; t.classList.add('show');
@@ -57,7 +58,8 @@ const S = {
   meta: { title: '', currentDraftId: null },
   drafts: [], bible: { characters: [], plotlines: [] }, bibleSaved: '',
   history: [], reports: {}, text: '', reportId: null, reportTab: 'summary', reportFilter: 'open',
-  busy: '', error: '', ai: null, compare: null, loaded: false,
+  busy: '', error: '', ai: null, aiSource: '', compare: null, loaded: false,
+  mode: 'edit', cat: 'all', sel: null, showResolved: false,
 };
 const currentDraft = () => S.drafts.find((d) => d.id === S.meta.currentDraftId) || S.drafts[S.drafts.length - 1] || null;
 const textDirty = () => S.text !== (currentDraft()?.text ?? '');
@@ -79,7 +81,23 @@ async function load() {
     S.error = 'Couldn’t load your saved work. ' + (e.message || '');
   }
   $('#store').textContent = { account: 'Saved to your account · private to you', browser: 'Saved in this browser only', memory: 'Not saved (storage unavailable)' }[Store.mode];
-  try { S.ai = window.claude && claude.use ? await claude.use('sample') : null; } catch (_) { S.ai = null; }
+  try { S.ai = window.claude && claude.use ? await claude.use('sample') : null; if (S.ai) S.aiSource = 'Claude'; } catch (_) { S.ai = null; }
+  if (!S.ai) {
+    try {
+      const h = await fetch('/api/health', { cache: 'no-store' });
+      const j = h.ok ? await h.json() : null;
+      if (j && j.ai) {
+        S.aiSource = j.model;
+        S.ai = async (prompt) => {
+          const r = await fetch('/api/ask', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt }) });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.error || 'The AI request failed.');
+          track('ai_call', { model: d.model, tokens_in: d.tokens_in, tokens_out: d.tokens_out, cost_usd: d.cost_usd, seconds: d.seconds });
+          return { text: d.text };
+        };
+      }
+    } catch (_) { /* not running locally: rule checks only */ }
+  }
   S.loaded = true;
   render();
 }
@@ -176,6 +194,7 @@ ${clip(d.text)}
   }
   await commitBible(`AI scan of Draft ${d.n}${d.text.length > AI_LIMIT ? ' (first ~10,000 words)' : ''}: ${added} added, ${filled} details filled`, 'AI scan');
   toast(`Story Bible updated: ${added} new, ${filled} details filled.`);
+  track('bible_scanned', { added, filled });
   location.hash = '#story-bible';
 }
 const findChar = (name) => S.bible.characters.find((x) => [x.name, ...(x.aliases || [])].some((n) => n && n.toLowerCase() === String(name).toLowerCase()));
@@ -223,11 +242,15 @@ ${clip(d.text)}
       aiUsed = true;
     } catch (e) { aiNote = e.message; }
   } else aiNote = 'AI wasn’t available, so this report uses the free rule checks only.';
+  for (const f of findings) f.pos = f.quotes.map((q) => { const i = d.text.indexOf(q); return i < 0 ? null : [i, i + q.length]; }).filter(Boolean);
+  findings.sort((a, b) => ((a.pos[0] || [1e9])[0]) - ((b.pos[0] || [1e9])[0]));
   const report = { draftId: d.id, draftN: d.n, createdAt: Date.now(), findings, aiUsed, dropped, aiNote, truncated: d.text.length > AI_LIMIT };
   await Store.set('meta/reports/' + d.id, report);
   S.reports[d.id] = { ...report, id: d.id };
-  S.reportId = d.id; S.reportTab = 'summary'; S.reportFilter = 'open';
-  location.hash = '#report';
+  S.reportId = d.id; S.cat = 'all'; S.showResolved = false; S.mode = 'review'; S.sel = visibleFindings()[0]?.id || null;
+  track('review_run', { findings: findings.length, ai: aiUsed, dropped, words: d.words });
+  toast(`Review done: ${findings.length} suggestion${findings.length === 1 ? '' : 's'}.`);
+  location.hash = '#manuscript';
 }
 
 async function setStatus(fid, status) {
@@ -242,6 +265,12 @@ async function setStatus(fid, status) {
   } else toast(status === 'approved' ? 'Approved.' : status === 'dismissed' ? 'Marked as not an issue.' : 'Moved back to open.');
   const { id, ...body } = r;
   await Store.set('meta/reports/' + id, body);
+  track(status === 'approved' ? 'finding_approved' : status === 'dismissed' ? 'finding_dismissed' : 'finding_reopened', { source: f.source, category: f.category });
+  if (status !== 'open') {
+    const all = curReport().findings.filter((x) => S.cat === 'all' || x.category === S.cat), at = all.findIndex((x) => x.id === fid);
+    const next = all.slice(at + 1).find((x) => x.status === 'open') || all.find((x) => x.status === 'open');
+    S.sel = next ? next.id : null;
+  }
   render();
 }
 function applyUpdate(u) {
@@ -315,54 +344,156 @@ function viewHome() {
   <div class="card" id="how">
     <h2>How Margins works</h2>
     <ol class="steps">
-      <li><b>Add your manuscript.</b> <span class="muted">Upload a .docx or .txt file, or paste text on the Manuscript tab. Save it as a version.</span></li>
+      <li><b>Add your manuscript.</b> <span class="muted">On the Manuscript tab, upload a .docx or .txt file or paste your text. Click <i>Update history</i> to save it as a draft.</span></li>
       <li><b>Build your Story Bible.</b> <span class="muted">Click <i>Scan for characters &amp; plotlines</i>. Review and edit them, then click <i>Update history</i> to save your changes.</span></li>
-      <li><b>Run a continuity review.</b> <span class="muted">Margins checks the manuscript against itself and your Story Bible, using AI plus free rule checks.</span></li>
-      <li><b>Review the report.</b> <span class="muted">Go through each tab. <i>Approve</i> what you'll fix (and record the right fact), or mark <i>Not an issue</i>.</span></li>
+      <li><b>Run a continuity review.</b> <span class="muted">Margins checks the manuscript against itself and your Story Bible, using AI plus free rule checks. Problems are highlighted in your text.</span></li>
+      <li><b>Work through the suggestions.</b> <span class="muted">The Suggestions panel has tabs for Characters, Plotlines, Timeline and Details. Step through them with the arrows, and click ✓ to approve (and record the right fact) or ✕ if it's not an issue.</span></li>
       <li><b>Revise and track.</b> <span class="muted">Edit and save new versions. History shows every draft and Story Bible change, side by side, with restore.</span></li>
     </ol>
-    <p class="muted small" style="margin:0">${Store.mode === 'account' ? 'Your work is saved to your account and only you can see it.' : 'Your work is saved in this browser.'} The AI reads up to about 10,000 words per run; review long books a few chapters at a time.</p>
+    <p class="muted small" style="margin:0">This site uses PostHog analytics, which may record visits (including session replays) to help improve Margins. ${Store.mode === 'account' ? 'Your work is saved to your account and only you can see it.' : 'Your work is saved in this browser.'} The AI reads up to about 10,000 words per run; review long books a few chapters at a time.</p>
   </div>`;
 }
 
-function viewManuscript() {
-  const d = currentDraft();
-  const dirty = textDirty();
-  return `
-  <div class="card">
-    <div class="spread">
-      <div style="flex:1;min-width:240px">
-        <label class="f" for="title">Book title</label>
-        <input type="text" id="title" value="${esc(S.meta.title)}" placeholder="Untitled manuscript" />
-      </div>
-      <div class="row">
-        <button class="btn sec" data-act="upload">Upload .docx or .txt</button>
-        <button class="btn sec" data-act="sample">Load sample</button>
-      </div>
-    </div>
-    <p class="muted small" style="margin:10px 0 6px">${d ? `Editing <b>Draft ${d.n}</b>${d.note ? ' · ' + esc(d.note) : ''} · saved ${when(d.createdAt)}` : 'No saved versions yet.'}
-      ${dirty ? ' · <span style="color:var(--warn)">unsaved changes</span>' : ''}</p>
-    <div class="dropzone" id="drop"><textarea class="editor" id="text" placeholder="Paste your manuscript here, or drop a .docx / .txt file…">${esc(S.text)}</textarea></div>
-    <div class="spread small muted" style="margin-top:6px"><span id="wc">${countWords(S.text).toLocaleString()} words</span><span>Margins never changes your text unless you edit it here.</span></div>
-  </div>
-  <div class="card">
-    <h2>Save a version</h2>
-    <div class="row">
-      <input type="text" id="vnote" style="flex:1;min-width:220px" placeholder="What changed? e.g. Rewrote chapter 3 ending" />
-      <button class="btn" data-act="save-version" ${S.text.trim() && dirty ? '' : 'disabled'}>Update history (save as Draft ${S.drafts.length ? S.drafts[S.drafts.length - 1].n + 1 : 1})</button>
-    </div>
-  </div>
-  <div class="card">
-    <h2>Check your manuscript</h2>
-    <p class="muted small">${S.ai ? 'AI is ready. You may be asked once to allow it.' : 'AI isn’t available here, so reviews use the free rule checks.'}</p>
-    <div class="row">
-      <button class="btn" data-act="scan" ${d && S.ai ? '' : 'disabled'}>Scan for characters &amp; plotlines</button>
-      <button class="btn" data-act="review" ${S.text.trim() ? '' : 'disabled'}>Run continuity review →</button>
-    </div>
-    ${!d ? '<p class="muted small" style="margin:8px 0 0">Save your manuscript as a version first to scan it.</p>' : ''}
-  </div>`;
+// ---------- workspace (3 panes) ----------
+const CHAPTER_RE = /^\s*(#{1,3}\s+.+|(chapter|part|prologue|epilogue|act)\b.{0,60})\s*$/i;
+function chapters(text) {
+  const out = []; let off = 0;
+  for (const line of String(text || '').split('\n')) { if (line.trim() && line.length < 80 && CHAPTER_RE.test(line)) out.push({ title: line.replace(/^#+\s*/, '').trim(), at: off }); off += line.length + 1; }
+  return out;
+}
+const curReport = () => S.reports[S.reportId] || null;
+function ensurePos(r) {
+  for (const f of r.findings) if (!f.pos) { const d = S.drafts.find((x) => x.id === r.draftId); f.pos = d ? f.quotes.map((q) => { const i = d.text.indexOf(q); return i < 0 ? null : [i, i + q.length]; }).filter(Boolean) : []; }
+}
+function visibleFindings() {
+  const r = curReport(); if (!r) return [];
+  ensurePos(r);
+  return r.findings.filter((f) => (S.cat === 'all' || f.category === S.cat) && (S.showResolved || f.status === 'open'));
 }
 
+function viewWorkspace() {
+  const d = currentDraft(), dirty = textDirty();
+  const chs = chapters(S.mode === 'review' && curReport() ? (S.drafts.find((x) => x.id === curReport().draftId)?.text || S.text) : S.text);
+  const left = `<aside class="pane side">
+    <div class="side-h">Manuscript</div>
+    <input type="text" id="title" class="title-in" value="${esc(S.meta.title)}" placeholder="Untitled manuscript" />
+    <p class="side-meta">${d ? `Draft ${d.n} · saved ${when(d.createdAt)}` : 'Not saved yet'}<span id="dirty" style="color:var(--warn)">${dirty ? ' · unsaved changes' : ''}</span></p>
+    <div class="side-h small-h">Chapters</div>
+    <div class="chlist">${chs.length ? chs.map((c, i) => `<button class="ch" data-act="goto-ch" data-id="${c.at}"><span>${i + 1}</span>${esc(c.title)}</button>`).join('') : '<p class="side-meta">No chapter headings found. Lines like “Chapter One” appear here.</p>'}</div>
+    <div class="side-foot">
+      <div class="row"><button class="btn sec small" data-act="upload">Upload .docx / .txt</button><button class="btn sec small" data-act="sample">Sample</button></div>
+      <label class="f" for="vnote">Save a version</label>
+      <input type="text" id="vnote" placeholder="What changed?" />
+      <button class="btn small" style="width:100%;margin-top:6px" data-act="save-version" ${S.text.trim() && dirty ? '' : 'disabled'}>Update history (save Draft ${S.drafts.length ? S.drafts[S.drafts.length - 1].n + 1 : 1})</button>
+      <p class="side-meta" id="wc" style="text-align:center;margin-top:10px">${countWords(S.text).toLocaleString()} words</p>
+    </div>
+  </aside>`;
+
+  const r = curReport();
+  let paper;
+  if (S.mode === 'review' && r) {
+    const rd = S.drafts.find((x) => x.id === r.draftId);
+    const stale = rd && rd.text !== S.text;
+    paper = (stale ? `<div class="stale">You've edited the text since this review. <button class="btn small" data-act="review">Review again</button></div>` : '') + annotated(rd ? rd.text : '', r);
+  } else {
+    paper = `<textarea id="text" class="paper-edit" placeholder="Paste your manuscript here, or drop a .docx / .txt file…&#10;&#10;Tip: start chapters on their own line, e.g. “Chapter One”, so they show in the chapter list.">${esc(S.text)}</textarea>`;
+  }
+  const center = `<section class="pane center">
+    <div class="center-bar">
+      <b class="doc-title">${esc(S.meta.title || 'Untitled manuscript')}</b>
+      <div class="seg"><button class="${S.mode === 'edit' ? 'on' : ''}" data-act="mode" data-id="edit">Edit</button><button class="${S.mode === 'review' ? 'on' : ''}" data-act="mode" data-id="review" ${r ? '' : 'disabled'}>Review highlights</button></div>
+    </div>
+    <div class="paper-wrap" id="paper-wrap"><div class="paper dropzone" id="drop">${paper}</div></div>
+  </section>`;
+
+  return `<div class="workspace">${left}${center}${suggestionsPane()}</div>`;
+}
+
+function annotated(text, r) {
+  const spans = [];
+  for (const f of r.findings) if (S.showResolved || f.status === 'open' || f.id === S.sel) for (const [a, b] of f.pos || []) spans.push({ a, b, f });
+  const lines = text.split('\n'); let off = 0, html = '';
+  for (const line of lines) {
+    const end = off + line.length;
+    if (!line.trim()) { off = end + 1; continue; }
+    const inl = spans.filter((s) => s.a < end && s.b > off);
+    const cuts = new Set([off, end]); inl.forEach((s) => { cuts.add(Math.max(s.a, off)); cuts.add(Math.min(s.b, end)); });
+    const pts = [...cuts].sort((x, y) => x - y); let body = '';
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p = pts[i], q = pts[i + 1], piece = esc(text.slice(p, q));
+      const cov = inl.filter((s) => s.a <= p && s.b >= q);
+      if (!cov.length) { body += piece; continue; }
+      const ids = [...new Set(cov.map((s) => s.f.id))];
+      body += `<mark data-f="${ids.join(' ')}" class="${ids.includes(S.sel) ? 'sel' : ''} ${cov[0].f.severity}">${piece}</mark>`;
+    }
+    const isCh = line.length < 80 && CHAPTER_RE.test(line);
+    html += isCh ? `<h2 class="chap" data-at="${off}">${body}</h2>` : `<p data-at="${off}">${body}</p>`;
+    off = end + 1;
+  }
+  return `<div class="paper-read" id="read">${html || '<p class="muted">Nothing to show.</p>'}</div>`;
+}
+
+function suggestionsPane() {
+  const r = curReport();
+  const actions = `<div class="row" style="margin-bottom:10px">
+      <button class="btn small" data-act="review" ${S.text.trim() ? '' : 'disabled'}>Run continuity review</button>
+      <button class="btn sec small" data-act="scan" ${currentDraft() && S.ai ? '' : 'disabled'}>Scan Story Bible</button></div>
+    <p class="side-meta" style="margin:0 0 12px">${S.ai ? `AI ready (${esc(S.aiSource)}) · plus free rule checks` : 'AI not available here · free rule checks only'}</p>`;
+  if (!r) return `<aside class="pane sugg"><div class="sugg-h"><b>Suggestions</b></div>${actions}
+    <div class="empty-s"><p><b>No review yet.</b></p><p class="side-meta">Add your manuscript, then run a continuity review. Suggestions appear here, and the matching words are highlighted in your text.</p></div></aside>`;
+  ensurePos(r);
+  const all = r.findings, done = all.filter((f) => f.status !== 'open').length, pct = all.length ? Math.round((done / all.length) * 100) : 100;
+  const list = visibleFindings();
+  if (!list.some((f) => f.id === S.sel)) S.sel = list[0]?.id || null;
+  const i = list.findIndex((f) => f.id === S.sel), f = list[i];
+  const cats = [['all', 'All'], ...CATS];
+  const tabs = cats.map(([k, l]) => { const n = all.filter((x) => (k === 'all' || x.category === k) && x.status === 'open').length; return `<button class="${S.cat === k ? 'on' : ''}" data-act="cat" data-id="${k}">${l}<span class="n">${n}</span></button>`; }).join('');
+  const card = f ? `<div class="scard ${f.status}">
+      <div class="row" style="justify-content:space-between">
+        <div class="row" style="gap:6px"><span class="pill ${f.severity}">${f.severity}</span><span class="pill">${esc(f.source)}</span>${f.status !== 'open' ? `<span class="pill ${f.status}">${f.status === 'approved' ? 'Approved' : 'Not an issue'}</span>` : ''}</div>
+        ${f.status === 'open' ? `<div class="row" style="gap:6px"><button class="iconbtn ok" title="Approve" data-act="approve" data-id="${f.id}">✓</button><button class="iconbtn no" title="Not an issue" data-act="dismiss" data-id="${f.id}">✕</button></div>` : `<button class="btn sec small" data-act="reopen" data-id="${f.id}">Undo</button>`}
+      </div>
+      <h3 style="margin-top:8px">${esc(f.title)}</h3>
+      <p class="side-meta" style="font-size:14px">${esc(f.explanation)}</p>
+      ${f.quotes.map((q, k) => `<button class="squote" data-act="goto-q" data-id="${f.id}" data-k="${k}">“${esc(q)}”</button>`).join('')}
+      ${f.bibleUpdate ? `<div class="upd">If approved, the Story Bible records <b>${esc(f.bibleUpdate.kind === 'plotline' ? f.bibleUpdate.title : f.bibleUpdate.name)}</b> · ${esc(f.bibleUpdate.field)} = <b>${esc(f.bibleUpdate.value)}</b>${f.applied ? ' ✓' : ''}</div>` : ''}
+    </div>` : `<div class="empty-s"><p><b>${S.showResolved ? 'Nothing in this section.' : 'All done here. 🎉'}</b></p><p class="side-meta">${S.showResolved ? '' : 'Every suggestion in this section has been reviewed.'}</p></div>`;
+  return `<aside class="pane sugg">
+    <div class="sugg-h"><b>Suggestions</b><span class="side-meta">Draft ${r.draftN} · ${when(r.createdAt)}</span></div>
+    ${actions}
+    <div class="spread side-meta"><span>${done} of ${all.length} reviewed</span><span>${pct}%</span></div>
+    <div class="progress" style="margin:4px 0 12px"><div style="width:${pct}%"></div></div>
+    <div class="ctabs">${tabs}</div>
+    <div class="pager"><button class="iconbtn" data-act="prev" ${i > 0 ? '' : 'disabled'} title="Previous">‹</button><span>${list.length ? `${i + 1} of ${list.length} suggestions` : '0 suggestions'}</span><button class="iconbtn" data-act="next" ${i >= 0 && i < list.length - 1 ? '' : 'disabled'} title="Next">›</button></div>
+    ${card}
+    <div class="slist">${list.filter((x) => x.id !== S.sel).map((x) => `<button class="srow" data-act="pick" data-id="${x.id}"><span class="dot ${x.severity}"></span><span>${esc(x.title)}</span>${x.status !== 'open' ? `<span class="pill ${x.status}" style="margin-left:auto">${x.status === 'approved' ? '✓' : '—'}</span>` : ''}</button>`).join('')}</div>
+    <div class="spread" style="margin-top:12px">
+      <label class="side-meta" style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" data-act="resolved" ${S.showResolved ? 'checked' : ''}/> Show resolved</label>
+      <div class="row" style="gap:6px">${Object.keys(S.reports).length > 1 ? `<select id="pick-report" style="width:auto;padding:4px 6px;font-size:12px">${Object.values(S.reports).sort((a, b) => b.createdAt - a.createdAt).map((x) => `<option value="${x.id}" ${x.id === r.id ? 'selected' : ''}>Draft ${x.draftN}</option>`).join('')}</select>` : ''}<button class="btn sec small" data-act="copy-report">Copy report</button></div>
+    </div>
+    ${r.dropped || r.truncated || (!r.aiUsed && r.aiNote) ? `<p class="side-meta" style="margin-top:10px">${!r.aiUsed && r.aiNote ? esc(r.aiNote) + ' ' : ''}${r.dropped ? `${r.dropped} AI suggestion(s) dropped because the quoted words weren't in your text. ` : ''}${r.truncated ? 'The AI read the first ~10,000 words.' : ''}</p>` : ''}
+  </aside>`;
+}
+
+// Scroll the manuscript to a finding's highlight (or a chapter).
+function scrollToMark(fid, k) {
+  const marks = [...document.querySelectorAll('#read mark')].filter((m) => m.dataset.f.split(' ').includes(fid));
+  const r = curReport(); const f = r?.findings.find((x) => x.id === fid);
+  let target = marks[0];
+  if (f && f.pos && f.pos[k || 0]) {
+    const want = f.pos[k || 0][0];
+    target = [...document.querySelectorAll('#read [data-at]')].filter((p) => +p.dataset.at <= want).pop()?.querySelector(`mark[data-f~="${fid}"]`) || target;
+  }
+  if (target) { target.scrollIntoView({ behavior: 'smooth', block: 'center' }); target.classList.remove('flash'); void target.offsetWidth; target.classList.add('flash'); }
+}
+function gotoChapter(at) {
+  if (S.mode === 'review' && $('#read')) { const el = [...document.querySelectorAll('#read [data-at]')].find((p) => +p.dataset.at >= at); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); return; }
+  const ta = $('#text'); if (!ta) return;
+  ta.focus(); ta.setSelectionRange(at, at);
+  const before = S.text.slice(0, at).split('\n').length, total = S.text.split('\n').length;
+  ta.scrollTop = Math.max(0, (before / total) * ta.scrollHeight - 40);
+}
+function select(fid, k) { S.sel = fid; if (S.mode !== 'review') S.mode = 'review'; render(); requestAnimationFrame(() => scrollToMark(fid, k)); }
 function field(kind, id, f, label, val, ph) {
   return `<div><label class="f">${label}</label><input type="text" data-bind="${kind}:${id}:${f}" value="${esc(val)}" placeholder="${ph || ''}" /></div>`;
 }
@@ -401,52 +532,6 @@ function viewBible() {
     ${plots ? `<div class="grid">${plots}</div>` : '<p class="muted">No plotlines yet. Scan your manuscript or add one.</p>'}</div>`;
 }
 
-function findingCard(f) {
-  const upd = f.bibleUpdate ? `<div class="upd">If approved, the Story Bible records: <b>${esc(f.bibleUpdate.kind === 'plotline' ? f.bibleUpdate.title : f.bibleUpdate.name)}</b> · ${esc(f.bibleUpdate.field)} = <b>${esc(f.bibleUpdate.value)}</b>${f.applied ? ' ✓ recorded' : ''}</div>` : '';
-  const actions = f.status === 'open'
-    ? `<button class="btn ok small" data-act="approve" data-id="${f.id}">✓ Approve</button><button class="btn sec small" data-act="dismiss" data-id="${f.id}">Not an issue</button>`
-    : `<span class="pill ${f.status}">${f.status === 'approved' ? 'Approved' : 'Not an issue'}</span><button class="btn sec small" data-act="reopen" data-id="${f.id}">Undo</button>`;
-  return `<div class="finding ${f.status}">
-    <div class="row" style="margin-bottom:4px"><span class="pill ${f.severity}">${f.severity}</span><span class="pill">${esc(f.source)}</span></div>
-    <h3>${esc(f.title)}</h3><p class="muted" style="margin-bottom:6px">${esc(f.explanation)}</p>
-    ${f.quotes.map((q) => `<div class="quote">“${esc(q)}”</div>`).join('')}
-    ${upd}<div class="row" style="margin-top:8px">${actions}</div></div>`;
-}
-function viewReport() {
-  const ids = Object.values(S.reports).sort((a, b) => b.createdAt - a.createdAt);
-  if (!ids.length) return `<div class="card"><h2>No report yet</h2><p class="muted">Run a continuity review from the Manuscript tab.</p><a class="btn" href="#manuscript">Go to Manuscript →</a></div>`;
-  const r = S.reports[S.reportId] || ids[0];
-  const all = r.findings, done = all.filter((f) => f.status !== 'open').length;
-  const pct = all.length ? Math.round((done / all.length) * 100) : 100;
-  const tabs = [['summary', 'Summary', null], ...CATS.map(([k, l]) => [k, l, all.filter((f) => f.category === k).length])];
-  let body;
-  if (S.reportTab === 'summary') {
-    const sev = (s) => all.filter((f) => f.severity === s && f.status === 'open').length;
-    body = `<div class="grid">
-      <div class="stat"><b>${all.length}</b><span class="muted small">findings</span></div>
-      <div class="stat"><b style="color:var(--bad)">${sev('high')}</b><span class="muted small">high priority still open</span></div>
-      <div class="stat"><b style="color:var(--ok)">${all.filter((f) => f.status === 'approved').length}</b><span class="muted small">approved</span></div>
-      <div class="stat"><b>${all.filter((f) => f.status === 'dismissed').length}</b><span class="muted small">not an issue</span></div></div>
-      <h3 style="margin-top:18px">By section</h3>
-      ${CATS.map(([k, l]) => { const n = all.filter((f) => f.category === k); return `<div class="spread" style="padding:8px 0;border-bottom:1px solid var(--border)"><span>${l}</span><span class="muted small">${n.filter((f) => f.status === 'open').length} open of ${n.length}</span><button class="btn sec small" data-act="tab" data-id="${k}" ${n.length ? '' : 'disabled'}>Open tab</button></div>`; }).join('')}
-      <p class="muted small" style="margin-top:12px">${r.aiUsed ? 'Checked by AI and the free rule checks.' : esc(r.aiNote || 'Free rule checks only.')}${r.dropped ? ` ${r.dropped} AI finding(s) were dropped because their quotes weren’t in your text.` : ''}${r.truncated ? ' The AI read the first ~10,000 words.' : ''}</p>`;
-  } else {
-    const list = all.filter((f) => f.category === S.reportTab && (S.reportFilter === 'all' || f.status === 'open'));
-    body = `<div class="row" style="margin-bottom:12px"><span class="muted small">Show:</span>
-      <button class="btn small ${S.reportFilter === 'open' ? '' : 'sec'}" data-act="filter" data-id="open">Open</button>
-      <button class="btn small ${S.reportFilter === 'all' ? '' : 'sec'}" data-act="filter" data-id="all">All</button></div>
-      ${list.map(findingCard).join('') || `<p class="muted">${S.reportFilter === 'open' ? 'Nothing left to review in this section. 🎉' : 'No findings in this section.'}</p>`}`;
-  }
-  return `<div class="card">
-    <div class="spread"><div><h2 style="margin:0">Continuity report · Draft ${r.draftN}</h2><p class="muted small" style="margin:0">${when(r.createdAt)}</p></div>
-      <div class="row">${ids.length > 1 ? `<select id="pick-report" style="width:auto">${ids.map((x) => `<option value="${x.id}" ${x.id === r.id ? 'selected' : ''}>Draft ${x.draftN} · ${when(x.createdAt)}</option>`).join('')}</select>` : ''}
-      <button class="btn sec small" data-act="copy-report">Copy report</button></div></div>
-    <div style="margin:14px 0 4px" class="spread small"><span>${done} of ${all.length} reviewed</span><span class="muted">${pct}%</span></div>
-    <div class="progress"><div style="width:${pct}%"></div></div>
-    <div class="tabs" role="tablist">${tabs.map(([k, l, n]) => `<button role="tab" class="${S.reportTab === k ? 'on' : ''}" data-act="tab" data-id="${k}">${l}${n !== null ? `<span class="n">${n}</span>` : ''}</button>`).join('')}</div>
-    ${body}</div>`;
-}
-
 function viewHistory() {
   const items = [
     ...S.drafts.map((d) => ({ t: 'draft', at: d.createdAt, d })),
@@ -475,16 +560,19 @@ function viewHistory() {
     : '<p class="muted">Nothing saved yet. Save your manuscript or update your Story Bible to start your history.</p>'}</div>`;
 }
 
-const VIEWS = { home: viewHome, manuscript: viewManuscript, 'story-bible': viewBible, report: viewReport, history: viewHistory };
-const route = () => (VIEWS[location.hash.slice(1)] ? location.hash.slice(1) : 'home');
+const VIEWS = { home: viewHome, manuscript: viewWorkspace, 'story-bible': viewBible, history: viewHistory };
+const route = () => { const h = location.hash.slice(1); return h === 'report' ? 'manuscript' : VIEWS[h] ? h : 'home'; };
 
 function render() {
   const v = route();
   document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('on', a.dataset.v === v));
   const banner = (S.busy ? `<div class="banner"><span class="spin"></span>${esc(S.busy)}</div>` : '') + (S.error ? `<div class="banner err">${esc(S.error)}</div>` : '');
   const keepScroll = window.scrollY;
-  $('#view').innerHTML = (v === 'home' ? '' : '<div style="height:24px"></div>') + banner + (S.loaded ? VIEWS[v]() : '<p class="muted" style="padding:40px 0">Loading your work…</p>');
+  const keep = {}; document.querySelectorAll('.pane, #paper-wrap, #text').forEach((el, i) => (keep[i] = el.scrollTop));
+  document.body.classList.toggle('ws', v === 'manuscript');
+  $('#view').innerHTML = (v === 'home' || v === 'manuscript' ? '' : '<div style="height:24px"></div>') + (v === 'manuscript' ? `<div class="ws-banner">${banner}</div>` : banner) + (S.loaded ? VIEWS[v]() : '<p class="muted" style="padding:40px 0">Loading your work…</p>');
   if (S.busy) document.querySelectorAll('#view button').forEach((b) => (b.disabled = true));
+  document.querySelectorAll('.pane, #paper-wrap, #text').forEach((el, i) => { if (keep[i]) el.scrollTop = keep[i]; });
   window.scrollTo(0, keepScroll);
 }
 
@@ -527,20 +615,22 @@ async function readFile(file) {
   else throw new Error('Please upload a .docx or .txt file.');
   S.text = text.replace(/\r\n/g, '\n').trim();
   if (!S.meta.title) S.meta.title = file.name.replace(/\.[^.]+$/, '');
-  location.hash = '#manuscript'; render();
-  toast(`Loaded ${file.name}. Save it as a version to keep it.`);
+  S.mode = 'edit'; location.hash = '#manuscript'; render();
+  track('file_uploaded', { type: file.name.split('.').pop() });
+  toast(`Loaded ${file.name}. Click Update history to save it as a draft.`);
 }
 
 // ---------- events ----------
 document.addEventListener('click', (e) => {
+  const mk = e.target.closest('#read mark'); if (mk) { S.sel = mk.dataset.f.split(' ')[0]; render(); return; }
   const a = e.target.closest('[data-act]'); if (!a) return;
   const id = a.dataset.id;
   switch (a.dataset.act) {
     case 'sample':
       if (S.text.trim() && textDirty()) { toast('Save or clear your current text first.'); return; }
-      S.text = SAMPLE; if (!S.meta.title) S.meta.title = 'The Partner (sample)'; location.hash = '#manuscript'; render(); toast('Sample loaded. Save it as a version, then scan or review.'); break;
+      S.text = SAMPLE; S.mode = 'edit'; if (!S.meta.title) S.meta.title = 'The Partner (sample)'; track('sample_loaded'); location.hash = '#manuscript'; render(); toast('Sample loaded. Save it as a version, then scan or review.'); break;
     case 'upload': $('#file').click(); break;
-    case 'save-version': busy('Saving version…', async () => { const d = await saveDraft($('#vnote')?.value.trim()); toast(`Saved as Draft ${d.n}.`); }); break;
+    case 'save-version': busy('Saving version…', async () => { const d = await saveDraft($('#vnote')?.value.trim()); track('version_saved', { draft: d.n, words: d.words }); toast(`Saved as Draft ${d.n}.`); }); break;
     case 'scan': busy('Reading your manuscript and building the Story Bible…', scanBible); break;
     case 'review': busy('Reviewing your manuscript for continuity…', runReview); break;
     case 'add-char': S.bible.characters.push(normChar({ name: 'New character' })); render(); break;
@@ -549,8 +639,13 @@ document.addEventListener('click', (e) => {
     case 'del-plot': S.bible.plotlines = S.bible.plotlines.filter((p) => p.id !== id); render(); break;
     case 'save-bible': busy('Saving your Story Bible…', async () => { await commitBible($('#bnote')?.value.trim() || 'Edited by author', 'Author edit'); toast('Story Bible saved to history.'); }); break;
     case 'discard-bible': S.bible = JSON.parse(S.bibleSaved); render(); break;
-    case 'tab': S.reportTab = id; render(); break;
-    case 'filter': S.reportFilter = id; render(); break;
+    case 'mode': S.mode = id; render(); if (id === 'review' && S.sel) requestAnimationFrame(() => scrollToMark(S.sel)); break;
+    case 'cat': S.cat = id; S.sel = null; render(); if (S.mode === 'review' && S.sel) requestAnimationFrame(() => scrollToMark(S.sel)); break;
+    case 'prev': case 'next': { const l = visibleFindings(), j = l.findIndex((x) => x.id === S.sel) + (a.dataset.act === 'next' ? 1 : -1); if (l[j]) select(l[j].id); break; }
+    case 'pick': select(id); break;
+    case 'goto-q': select(id, +a.dataset.k); break;
+    case 'goto-ch': gotoChapter(+id); break;
+    case 'resolved': S.showResolved = a.checked; render(); break;
     case 'approve': busy('Saving…', () => setStatus(id, 'approved')); break;
     case 'dismiss': busy('Saving…', () => setStatus(id, 'dismissed')); break;
     case 'reopen': busy('Saving…', () => setStatus(id, 'open')); break;
@@ -560,7 +655,7 @@ document.addEventListener('click', (e) => {
     case 'close-compare': S.compare = null; render(); break;
     case 'open-draft': {
       if (textDirty()) { toast('Save your current changes first (Manuscript tab).'); return; }
-      S.meta.currentDraftId = id; S.text = S.drafts.find((d) => d.id === id).text;
+      S.meta.currentDraftId = id; S.text = S.drafts.find((d) => d.id === id).text; S.mode = 'edit';
       busy('Opening…', () => Store.set('meta', S.meta)); location.hash = '#manuscript'; break;
     }
     case 'restore-draft': busy('Restoring…', async () => { const d = S.drafts.find((x) => x.id === id); S.text = d.text; const nd = await saveDraft(`Restored from Draft ${d.n}`); toast(`Draft ${d.n} restored as Draft ${nd.n}.`); }); break;
@@ -569,7 +664,7 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('input', (e) => {
   const t = e.target;
-  if (t.id === 'text') { S.text = t.value; const wc = $('#wc'); if (wc) wc.textContent = countWords(S.text).toLocaleString() + ' words'; updateSaveButton(); return; }
+  if (t.id === 'text') { S.text = t.value; const wc = $('#wc'); if (wc) wc.textContent = countWords(S.text).toLocaleString() + ' words'; updateSaveButton(); const dm = $('#dirty'); if (dm) dm.textContent = textDirty() ? ' · unsaved changes' : ''; return; }
   if (t.id === 'title') { S.meta.title = t.value; clearTimeout(t._t); t._t = setTimeout(() => Store.set('meta', S.meta).catch(() => {}), 800); return; }
   const b = t.dataset.bind; if (!b) return;
   const [kind, id, f] = b.split(':');
