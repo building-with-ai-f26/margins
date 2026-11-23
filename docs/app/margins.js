@@ -254,7 +254,7 @@ async function load() {
   } else S.user = Who.get();
   if (S.user) await loadUser();
   setCloudAI();
-  try { S.ai = window.claude && claude.use ? await claude.use('sample') : null; if (S.ai) S.aiSource = 'Claude'; } catch (_) { S.ai = null; }
+  if (Store.mode !== 'cloud') { try { S.ai = window.claude && claude.use ? await claude.use('sample') : null; if (S.ai) S.aiSource = 'Claude'; } catch (_) { S.ai = null; } }
   if (!S.ai && Store.mode !== 'cloud') {
     try {
       if (!/^https?:/.test(location.protocol)) throw 0;
