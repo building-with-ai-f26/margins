@@ -351,8 +351,13 @@ function locate(text, quote) {
   const norm = (s) => s.replace(/[’‘]/g, "'").replace(/[“”]/g, '"');
   const ws = norm(quote).split(/\s+/).filter(Boolean).map(reEsc);
   if (!ws.length) return null;
-  const m = new RegExp(ws.join('\\s+'), 'i').exec(norm(text));
-  return m ? text.slice(m.index, m.index + m[0].length) : null;
+  const T = norm(text);
+  const hit = (words) => { const m = new RegExp(words.join('\\s+'), 'i').exec(T); return m ? text.slice(m.index, m.index + m[0].length) : null; };
+  const whole = hit(ws); if (whole) return whole;
+  // AI quotes are sometimes slightly off: trim quote marks and ellipses, then try the longest matching run of 4+ words.
+  const w2 = norm(quote).replace(/^[\s"'.…]+|[\s"'.…]+$/g, '').split(/\s+/).filter(Boolean).map(reEsc);
+  for (let len = w2.length; len >= 4; len--) for (let i = 0; i + len <= w2.length; i++) { const r = hit(w2.slice(i, i + len)); if (r) return r; }
+  return null;
 }
 
 // ---------- applying fixes to the text, with undo ----------
@@ -541,29 +546,37 @@ async function runReview() {
   let aiUsed = false, dropped = 0, aiNote = '';
   if (S.ai) {
     try {
-      const out = await askAI(`You are a careful copy editor and continuity editor for fiction. Report ONLY real problems in the manuscript below.
+      // Two focused requests at once: grammar, and story conflicts (a small model skips conflicts when asked for both).
+      const MS = `Manuscript:\n"""\n${clip(text)}\n"""`;
+      const [gr, cf] = await Promise.all([
+        askAI(`You are a careful copy editor for fiction. List spelling, grammar and punctuation errors in the manuscript below.
+Give the exact wrong words in "find" (short, with just enough context to be unique, copied character for character) and the corrected words in "replace". Respect the author's voice: do not change dialect in dialogue, deliberate fragments, or style choices. At most 15 items.
+Reply with JSON only: {"items":[{"category":"grammar","title":"","explanation":"","find":"","replace":""}]}
 
-1. "grammar": spelling, grammar and punctuation errors. Give the exact wrong words in "find" (short, with just enough context to be unique) and the corrected words in "replace". Respect the author's voice: do not change dialect in dialogue, deliberate fragments, or style choices.
-
-2. "characters", "plot", "timeline", "details": CONFLICTS ONLY, meaning two or more places that cannot both be true (e.g. green eyes in one place and blue eyes in another; age 34 then 36 with no time passing; a character who died later appears alive; a plot thread resolved twice; events in an impossible order; a name spelled two ways), or text that contradicts the author's Glossary below.
-   Do NOT report a fact that is simply stated, something that is only unexplained, or a style opinion.
-   For each conflict give "options": one per version of the truth, each with a short "label" (e.g. "Green eyes") and "fixes": the edits that make the whole text agree with that option, each {"find": exact words from the text, "replace": the corrected words}.
-
-Every "quotes" entry and every "find" must be copied character for character from the manuscript. At most 20 items. If there are none, return an empty list.
-Reply with JSON only:
-{"items":[{"category":"grammar","title":"","explanation":"","find":"","replace":""},
- {"category":"characters|plot|timeline|details","title":"","explanation":"","severity":"high|medium|low","quotes":["",""],"options":[{"label":"","fixes":[{"find":"","replace":""}]}]}]}
+${MS}`).catch((e) => ({ items: [], err: e.message })),
+        askAI(`You are a continuity editor for fiction. Find CONFLICTS: places in the manuscript below that cannot all be true at once, or text that contradicts the author's Glossary.
+Work through this checklist and compare every mention across the whole text:
+- characters: ages, birth order (older/younger sibling), relationships, appearance (eyes, hair, height, scars), jobs, who is alive or dead
+- timeline: years and dates, "X years ago" against stated years, times of day, the order of events, durations
+- plot: events that happen twice or contradict each other, objects or facts that change, things a character couldn't know
+- details: names spelled two ways, places, numbers, colours, weather
+Do arithmetic when needed (e.g. "twelve years" away but a visit in 2018 described as the last one).
+Do NOT report spelling or grammar, a fact stated only once, something merely unexplained, or a style opinion.
+For each conflict: "category" (characters, plot, timeline or details), a short "title", a one-sentence "explanation", "severity" (high, medium or low), "quotes" (the two or more conflicting passages, each copied character for character, 3 to 15 words), and "options": one per version of the truth, each with a short "label" and "fixes" ({"find": exact words from the text, "replace": corrected words}) that make the text agree with that option.
+At most 15 items. If there are none, return {"items":[]}.
+Reply with JSON only: {"items":[{"category":"","title":"","explanation":"","severity":"","quotes":["",""],"options":[{"label":"","fixes":[{"find":"","replace":""}]}]}]}
 
 Glossary (facts the author has confirmed):
 ${JSON.stringify(S.bible)}
 
-Manuscript:
-"""
-${clip(text)}
-"""`);
+${MS}`).catch((e) => ({ items: [], err: e.message })),
+      ]);
+      if (gr.err && cf.err) throw new Error(cf.err);
+      const out = { items: [...(gr.items || []), ...(cf.items || [])] };
       const ai = [];
       for (const f of out.items || out.findings || []) {
-        const cat = f.category === 'plotlines' ? 'plot' : f.category;
+        const c0 = String(f.category || '').toLowerCase().trim();
+        const cat = ({ plotlines: 'plot', plotline: 'plot', character: 'characters', detail: 'details', names: 'details', name: 'details' })[c0] || c0;
         if (cat === 'grammar') {
           const find = locate(text, String(f.find || ''));
           if (!find || !f.replace || find === f.replace) { dropped++; continue; }
