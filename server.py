@@ -27,6 +27,8 @@ ROOT = Path(__file__).resolve().parent
 SITE_DIR = ROOT / "docs"
 PORT = int(os.environ.get("PORT", "8000"))
 MAX_CHARS = 20000  # keeps each run small and cheap (~3,500 words)
+DATA_DIR = ROOT / "margins-data"  # each signed-in email's work, saved as JSON files (git-ignored)
+SEGMENT = re.compile(r"^[A-Za-z0-9._@+~:-]{1,200}$")
 
 
 # ---------- settings from .env ----------
@@ -175,6 +177,20 @@ def review(text):
     }
 
 
+# ---------- saving each user's work on this computer ----------
+
+def store_path(path, doc):
+    """Turn 'accounts/<email>/meta/drafts/<id>' into a file path inside margins-data, refusing anything unsafe.
+    Documents ('accounts/<email>/meta') have an odd number of parts; lists ('accounts/<email>/meta/drafts') an even number."""
+    parts = [p for p in str(path).split("/") if p]
+    if not parts or len(parts) > 16 or (len(parts) % 2 == 1) != doc:
+        return None
+    if any(not SEGMENT.match(p) or p in (".", "..") for p in parts):
+        return None
+    target = DATA_DIR.joinpath(*parts)
+    return target if DATA_DIR.resolve() in target.resolve().parents or target.resolve() == DATA_DIR.resolve() else None
+
+
 # ---------- web server ----------
 
 class Handler(SimpleHTTPRequestHandler):
@@ -193,12 +209,16 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/favicon.ico":  # no tab icon; answer quietly instead of logging an error
             self.send_response(204); self.end_headers(); return
         if self.path == "/api/health":
-            return self.send_json(200, {"ok": True, "ai": key_is_set(), "model": MODEL})
+            return self.send_json(200, {"ok": True, "ai": key_is_set(), "model": MODEL, "store": True})
+        if self.path.startswith("/api/store"):
+            return self.store_get()
         return super().do_GET()
 
     def do_POST(self):
         if self.path == "/api/ask":
             return self.ask()
+        if self.path == "/api/store":
+            return self.store_set()
         if self.path != "/api/review":
             return self.send_json(404, {"error": "Not found"})
         if not key_is_set():
@@ -227,6 +247,46 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as e:  # never crash the server on one bad reply
             print(f"Unexpected error: {e!r}", file=sys.stderr)
             return self.send_json(500, {"error": "Something went wrong with the AI review. See the terminal for details."})
+
+    def store_get(self):
+        from urllib.parse import urlparse, parse_qs
+        url = urlparse(self.path)
+        q = {k: v[0] for k, v in parse_qs(url.query).items()}
+        if url.path == "/api/store/list":
+            folder = store_path(q.get("col", ""), doc=False)
+            if folder is None:
+                return self.send_json(400, {"error": "Bad list path."})
+            items = []
+            if folder.is_dir():
+                for f in sorted(folder.glob("*.json")):
+                    try:
+                        items.append({**json.loads(f.read_text(encoding="utf-8")), "id": f.stem})
+                    except ValueError:
+                        pass
+            return self.send_json(200, {"items": items})
+        target = store_path(q.get("path", ""), doc=True)
+        if target is None:
+            return self.send_json(400, {"error": "Bad document path."})
+        f = target.with_name(target.name + ".json")
+        data = json.loads(f.read_text(encoding="utf-8")) if f.is_file() else None
+        return self.send_json(200, {"data": data})
+
+    def store_set(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 2_000_000:
+                return self.send_json(413, {"error": "That's too large to save in one piece. Try a few chapters at a time."})
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return self.send_json(400, {"error": "Bad request."})
+        target = store_path(body.get("path", ""), doc=True)
+        if target is None or not isinstance(body.get("data"), dict):
+            return self.send_json(400, {"error": "Bad document path."})
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".json.tmp")
+        tmp.write_text(json.dumps(body["data"]), encoding="utf-8")
+        tmp.replace(target.with_name(target.name + ".json"))  # write then swap, so a crash never leaves half a file
+        return self.send_json(200, {"ok": True})
 
     def ask(self):
         """Forward one prompt from the Margins app to OpenRouter and return the reply text."""
@@ -274,6 +334,7 @@ class Handler(SimpleHTTPRequestHandler):
 def main():
     print("Margins is running at:  http://localhost:%d/app/   (Product Page: http://localhost:%d/)" % (PORT, PORT))
     print("AI review:", f"ON (model {MODEL})" if key_is_set() else "OFF (add OPENROUTER_API_KEY to .env)")
+    print("Saving each signed-in user's work in:", DATA_DIR)
     print("Press Control + C to stop.")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
