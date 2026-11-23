@@ -161,11 +161,13 @@
   <h2>Product Showcase (Prototype / Live App / 2-Min Video)</h2>
 
   <p>
-    <strong>Current Status:</strong> Build 2 — working manuscript review app with a real AI call.
-    Authors add a manuscript, AI builds a Story Bible of characters and plotlines, and a continuity
-    review returns suggestions the author approves or dismisses.<br />
+    <strong>Current Status:</strong> Build 3 — live at a real URL with accounts, a database and AI.
+    Authors create an account, add a manuscript, scan it into a Glossary of characters and plotlines, and run a review
+    that sorts real conflicts into five tabs (Grammar &amp; punctuation, Characters, Plot, Timeline, Details &amp; names),
+    each with options that fix the text in one click.<br />
     <strong>Demo:</strong> <a href="app/" onclick="window.posthog && posthog.capture('clicked_try_product', {from: 'showcase'})">Open the Margins app</a>.
-    The AI review runs when the app is run locally (<code>python3 server.py</code>, with the OpenRouter key kept in a private <code>.env</code> file) and in the Claude-hosted version. This public GitHub Pages version runs the free rule checks only, because an API key can't be kept secret on a public page.
+    Create an account (email + password) to save your work and use the AI review (30 a day), or click <strong>See how it works</strong> to try a no-sign-in demo with up to 1,000 words.
+    Security audit: <a href="https://github.com/building-with-ai-f26/margins/blob/main/SECURITY.md">SECURITY.md</a> · <a href="app/security-test.html">Live security test</a>.
   </p>
 
   <p class="meta">
@@ -257,20 +259,32 @@
       <h3>1. Target User & The Job to Be Done</h3>
       <p><strong>Who is this for?</strong> An emerging or self-publishing fiction author preparing a manuscript for editing. A potential early feedback contact is an author I previously supported during a book launch internship; feedback has not yet been collected.</p>
       <p><strong>The painful "Before" workflow:</strong> Authors reread drafts and use repeated proofreading and editing rounds to catch mechanical errors and story inconsistencies. Important issues may remain after multiple passes, diverting attention from creative development.</p>
-      <p><strong>The "After" workflow with this product:</strong> The author pastes an excerpt, receives clearly explained potential inconsistencies with supporting phrases, and decides what—if anything—to revise. The author retains editorial control.</p>
+      <p><strong>The "After" workflow with this product:</strong> The author signs in, pastes or uploads a manuscript, scans it into a Glossary, and receives only real conflicts (two places in the text that disagree), each with the evidence highlighted and options to choose from. Choosing an option fixes the text; every change can be undone. The author retains editorial control.</p>
 
       <h3>2. Scope & Explicit Non-Goals</h3>
       <ul>
-        <li><strong>In Scope (Core Workflow):</strong> Upload or paste a manuscript excerpt → save it as a draft → (optional) AI builds a Story Bible of characters and plotlines → run a continuity review → step through the suggestions by category and approve or dismiss each one, with the evidence highlighted in the text.</li>
-        <li><strong>Out of Scope #1:</strong> Automatically rewriting or replacing the author’s prose.</li>
+        <li><strong>In Scope (Core Workflow, PRD v3):</strong> Sign in → upload or paste a manuscript → Scan to Add to Glossary (characters and plotlines; conflicting facts go to a Glossary conflicts tab) → run a review → step through five tabs of conflicts and grammar fixes, choosing an option or a one-click fix that updates the text → undo any change → save a new draft when ready, with version history.</li>
+        <li><strong>Out of Scope #1:</strong> Automatically rewriting the author’s prose. Margins only changes the specific words the author chooses in a suggestion, and every change can be undone.</li>
         <li><strong>Out of Scope #2:</strong> Whole-book, multi-chapter analysis.</li>
         <li><strong>Out of Scope #3:</strong> Replacing human editors or providing publishing and marketing services.</li>
       </ul>
 
       <h3>3. How It Works Under the Hood & Riskiest Assumption (Week 2+)</h3>
+      <p><strong>Biggest Risk (PRD v3):</strong> Still that the AI flags noise instead of real conflicts. <strong>Build 3 change:</strong> suggestions are now conflict-only. The AI must quote two places that disagree (or text that disagrees with the Glossary), and anything else is dropped. Each conflict comes with options (for example "Green eyes" / "Blue eyes") so the author decides which is right, and PostHog tracks which options authors choose or dismiss.</p>
       <p><strong>Biggest Risk (PRD v2):</strong> The AI invents contradictions that aren't in the text, or flags so many minor or intentional choices (flashbacks, time passing) that authors stop trusting the suggestions.</p>
       <p><strong>How Build 2 tests it:</strong> Every AI suggestion must quote the exact words from the manuscript. Margins checks each quote against the text and drops any suggestion whose quote can't be found, then highlights the real words so the author can judge in context. AI suggestions sit beside free rule-based checks, and the author approves or dismisses each one, so I can see how many AI suggestions are useful versus noise. In the first real tests, a 1,470-word excerpt returned 7 suggestions and a 580-word excerpt returned 14. The AI suggestions quoted real passages, but some were not real contradictions (for example, "Lily's Age" only restated that Lily is 13). That confirms the risk: the next build needs a stricter prompt and a way to measure how many AI suggestions authors dismiss.</p>
-      <p><strong>How the app works:</strong> The author pastes or uploads a manuscript (.docx or .txt) → saves it as a numbered draft → the app sends the text (and the author's Story Bible) to an AI model with instructions to return characters, plotlines or continuity issues as structured data with exact quotes → the app verifies the quotes, merges in rule-based checks, and shows a tabbed report → approving a suggestion can update the Story Bible, and every draft and Story Bible change is kept in a version history. Run locally, the app talks to a small Python server (<code>server.py</code>) on the author's computer, which reads the OpenRouter API key from a private <code>.env</code> file and calls <code>openai/gpt-4o-mini</code>; the key never reaches the browser or GitHub. The Claude-hosted version uses Claude instead and saves each author's work privately to their account. The GitHub Pages version runs the rule checks only, because an AI key can't be kept secret on a public web page.</p>
+      <p><strong>How the app works:</strong> The author pastes or uploads a manuscript (.docx or .txt) → saves it as a numbered draft → the app sends the text (and the author's Story Bible) to an AI model with instructions to return characters, plotlines or continuity issues as structured data with exact quotes → the app verifies the quotes, merges in rule-based checks, and shows a tabbed report → approving a suggestion can update the Story Bible, and every draft and Story Bible change is kept in a version history. Run locally, the app talks to a small Python server (<code>server.py</code>) on the author's computer, which reads the OpenRouter API key from a private <code>.env</code> file and calls <code>openai/gpt-4o-mini</code>; the key never reaches the browser or GitHub. The Claude-hosted version uses Claude instead and saves each author's work privately to their account. <em>(PRD v2. In Build 3 the "Story Bible" was renamed the Glossary, and the public site gained AI through Supabase; see section 5.)</em></p>
+
+      <h3>5. Hosting, Database &amp; Security (PRD v3)</h3>
+      <ul>
+        <li><strong>Hosting:</strong> GitHub Pages serves the Product Page and the app from the <code>docs/</code> folder at <a href="https://building-with-ai-f26.github.io/margins/app/">building-with-ai-f26.github.io/margins/app/</a>. It's free, needs no build step, and works on phones.</li>
+        <li><strong>Sign-in:</strong> Supabase Auth with email + password. I chose passwords over magic links because Supabase's built-in email only sends 2 emails an hour, and turned "Confirm email" off for the class test.</li>
+        <li><strong>Database:</strong> Supabase Postgres. Each saved item (drafts, Glossary, history, reports, the auto-saved working copy) is one row in a <code>docs</code> table with the owner's user ID. Row-level security means a signed-in person can only read, add, change or delete their own rows, and signed-out visitors can't read the table at all.</li>
+        <li><strong>AI:</strong> a Supabase Edge Function (<code>smart-task</code>) calls OpenRouter (<code>openai/gpt-4o-mini</code>). The API key is a Supabase secret, so it never reaches the browser or GitHub. The function only works for signed-in users, allows 30 requests per person per day, and caps request size; the OpenRouter key also has a $2 spending cap.</li>
+        <li><strong>Why Supabase and not Netlify:</strong> Netlify could host the pages and an AI function, but Margins also needs accounts and a locked-down database. Supabase gives sign-in, the database with row-level security, and the AI function in one free project, while GitHub Pages keeps hosting the site.</li>
+        <li><strong>Security:</strong> full audit in <a href="https://github.com/building-with-ai-f26/margins/blob/main/SECURITY.md">SECURITY.md</a>. Proof: the <a href="app/security-test.html">security test page</a> signs in as a second account and tries to read, overwrite and delete the first account's work. Every attempt is refused. Session replays mask the manuscript text and all typed input.</li>
+        <li><strong>Analytics:</strong> PostHog and session replay stay on the live Product Page and app (events include demo started, account created, signed in, review run, AI call with cost, option chosen, suggestion dismissed and draft saved).</li>
+      </ul>
 
       <h3>4. Unit Economics & Analytics Snapshot (Updated Weekly)</h3>
       <div class="grid-2">
@@ -280,7 +294,7 @@
         </div>
         <div class="stat-box">
           <div class="stat-label">Est. Cost Per User Run</div>
-          <div class="stat-value">$0.00086 per AI review (measured: 580-word excerpt, gpt-4o-mini via OpenRouter); rule checks $0</div>
+          <div class="stat-value">$0.00086 per AI review (measured: 580-word excerpt, gpt-4o-mini via OpenRouter); rule checks $0. Max per user per day: 30 requests ≈ $0.03. Hosting and database: $0 (GitHub Pages + Supabase free tier)</div>
         </div>
         <div class="stat-box">
           <div class="stat-label">User Evidence (Analytics from Build 2)</div>
@@ -321,9 +335,10 @@
       <div class="log-entry">
         <h3>Build 3 · Build.exe: The Core Workflow (Due Nov 23)</h3>
         <ul>
-          <li><strong>What shipped:</strong> [End-to-end workflow working with real inputs + PostHog funnel events]</li>
-          <li><strong>What broke / changed in PRD:</strong> To be recorded after testing</li>
-          <li><strong>Cost & time this week:</strong> Actual spend and hours to be entered by the builder</li>
+          <li><strong>What shipped:</strong> Margins is live with real accounts. Authors sign up with email + password (Supabase), their work saves to a Supabase database locked to their account by row-level security, and AI reviews run on the public site through a Supabase function that keeps the API key secret and limits each person to 30 a day. The review was rebuilt around real conflicts: five big tabs (Grammar &amp; punctuation, Characters, Plot, Timeline, Details &amp; names) plus Glossary conflicts, options that fix the text in one click, Undo and Recent changes, an auto-saved working copy, and drafts saved only when the author chooses. "Story Bible" became the Glossary, filled by Scan to Add to Glossary. The home page offers Sign in or See how it works (a 1,000-word demo that saves nothing). Added SECURITY.md, a live security test page, Shipping and Ask me first sections in AGENTS.md, and PRD v3.</li>
+          <li><strong>Security test:</strong> a second account tried to list, read, overwrite, edit and delete the first account's work, and a signed-out visitor tried to read the data and use the AI. All were refused (screenshot submitted).</li>
+          <li><strong>What broke / changed in PRD:</strong> Supabase's built-in email allows only 2 emails an hour, so magic-link sign-in wasn't practical; I switched to email + password with confirmation off. The AI function name came out as <code>smart-task</code> instead of the name I planned, and the app was updated to match. A stray backslash typed into the code broke the whole app once; that became a rule in AGENTS.md. The PRD moved from approving or dismissing suggestions to choosing between options that fix the text.</li>
+          <li><strong>Cost & time this week:</strong> $0 new spend (Supabase free tier; existing ChatGPT and Claude subscriptions; OpenRouter credit from Build 2). Time: [add your hours].</li>
         </ul>
       </div>
 
