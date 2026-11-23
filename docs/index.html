@@ -174,6 +174,35 @@
     This page and the Margins app use PostHog analytics, which may record visits (including session replays) to help improve the product.
   </p>
 
+  <h3>Build 3 Walkthrough</h3>
+
+  <h3>1. Home page: sign in or see how it works</h3>
+  <p>
+    The live home page now offers two choices: <strong>Sign in</strong> to a private account (email + password), or
+    <strong>See how it works</strong>, a demo that accepts up to 1,000 words and saves nothing. The feature cards describe the
+    Glossary, version history, the tabbed suggestions and how the author chooses each fix.
+  </p>
+  <img src="margins-build3-home.png" alt="Margins Build 3 home page with Sign in and See how it works buttons" style="width:100%; height:auto; margin-bottom:20px; border:1px solid #e5e7eb; border-radius:8px;" />
+
+  <h3>2. A review on the live site, sorted into five tabs</h3>
+  <p>
+    Signed in, the author reviewed a 1,198-word sample written with deliberate errors. The AI review runs through Supabase
+    ("AI ready (gpt-4o-mini)") and returned 18 suggestions: 8 grammar and punctuation fixes and 10 story conflicts across
+    Characters (2), Plot (2), Timeline (3) and Details &amp; names (3). The open card shows a grammar fix ("The streets was" →
+    "were") with the original and suggested words, an <em>Accept fix</em> button and <em>Not an issue</em>. Accepted fixes appear
+    under Recent changes with Undo, and the work auto-saves to the author's account. (Email blurred.)
+  </p>
+  <img src="margins-build3-review.png" alt="Margins workspace after an AI review showing five suggestion tabs with counts and a grammar fix card" style="width:100%; height:auto; margin-bottom:20px; border:1px solid #e5e7eb; border-radius:8px;" />
+
+  <h3>3. Security test: a second account is refused</h3>
+  <p>
+    The <a href="app/security-test.html">security test page</a> ran against the live Supabase project. Account A saved a private
+    note. Account B and a signed-out visitor then tried to list, read, overwrite, edit and delete it, read the AI usage table,
+    and use the AI. Every attempt was refused by row-level security or the sign-in check, and Account A's note was unchanged.
+    All 10 checks passed. Details in <a href="https://github.com/building-with-ai-f26/margins/blob/main/SECURITY.md">SECURITY.md</a>.
+  </p>
+  <img src="margins-build3-security-test.png" alt="Security test results: all 10 checks passed, every attempt by the second account refused" style="width:100%; height:auto; margin-bottom:20px; border:1px solid #e5e7eb; border-radius:8px;" />
+
   <h3>Build 2 Walkthrough</h3>
 
   <h3>1. Home page and instructions</h3>
@@ -280,7 +309,7 @@
         <li><strong>Hosting:</strong> GitHub Pages serves the Product Page and the app from the <code>docs/</code> folder at <a href="https://building-with-ai-f26.github.io/margins/app/">building-with-ai-f26.github.io/margins/app/</a>. It's free, needs no build step, and works on phones.</li>
         <li><strong>Sign-in:</strong> Supabase Auth with email + password. I chose passwords over magic links because Supabase's built-in email only sends 2 emails an hour, and turned "Confirm email" off for the class test.</li>
         <li><strong>Database:</strong> Supabase Postgres. Each saved item (drafts, Glossary, history, reports, the auto-saved working copy) is one row in a <code>docs</code> table with the owner's user ID. Row-level security means a signed-in person can only read, add, change or delete their own rows, and signed-out visitors can't read the table at all.</li>
-        <li><strong>AI:</strong> a Supabase Edge Function (<code>smart-task</code>) calls OpenRouter (<code>openai/gpt-4o-mini</code>). The API key is a Supabase secret, so it never reaches the browser or GitHub. The function only works for signed-in users, allows 30 requests per person per day, and caps request size; the OpenRouter key also has a $2 spending cap.</li>
+        <li><strong>AI:</strong> a Supabase Edge Function (<code>smart-task</code>) calls OpenRouter (<code>openai/gpt-4o-mini</code>). The API key is a Supabase secret, so it never reaches the browser or GitHub. The function only works for signed-in users, allows 30 requests per person per day (each review uses 2: one for grammar, one for story conflicts, so about 15 reviews a day), and caps request size; the OpenRouter key also has a $2 spending cap.</li>
         <li><strong>Why Supabase and not Netlify:</strong> Netlify could host the pages and an AI function, but Margins also needs accounts and a locked-down database. Supabase gives sign-in, the database with row-level security, and the AI function in one free project, while GitHub Pages keeps hosting the site.</li>
         <li><strong>Security:</strong> full audit in <a href="https://github.com/building-with-ai-f26/margins/blob/main/SECURITY.md">SECURITY.md</a>. Proof: the <a href="app/security-test.html">security test page</a> signs in as a second account and tries to read, overwrite and delete the first account's work. Every attempt is refused. Session replays mask the manuscript text and all typed input.</li>
         <li><strong>Analytics:</strong> PostHog and session replay stay on the live Product Page and app (events include demo started, account created, signed in, review run, AI call with cost, option chosen, suggestion dismissed and draft saved).</li>
@@ -294,7 +323,7 @@
         </div>
         <div class="stat-box">
           <div class="stat-label">Est. Cost Per User Run</div>
-          <div class="stat-value">$0.00086 per AI review (measured: 580-word excerpt, gpt-4o-mini via OpenRouter); rule checks $0. Max per user per day: 30 requests ≈ $0.03. Hosting and database: $0 (GitHub Pages + Supabase free tier)</div>
+          <div class="stat-value">$0.00086 per AI review (measured: 580-word excerpt, gpt-4o-mini via OpenRouter); rule checks $0. Each review now makes 2 AI requests (grammar + conflicts), about $0.002 per review. Max per user per day: 30 requests ≈ $0.03. Hosting and database: $0 (GitHub Pages + Supabase free tier)</div>
         </div>
         <div class="stat-box">
           <div class="stat-label">User Evidence (Analytics from Build 2)</div>
@@ -337,8 +366,8 @@
         <ul>
           <li><strong>What shipped:</strong> Margins is live with real accounts. Authors sign up with email + password (Supabase), their work saves to a Supabase database locked to their account by row-level security, and AI reviews run on the public site through a Supabase function that keeps the API key secret and limits each person to 30 a day. The review was rebuilt around real conflicts: five big tabs (Grammar &amp; punctuation, Characters, Plot, Timeline, Details &amp; names) plus Glossary conflicts, options that fix the text in one click, Undo and Recent changes, an auto-saved working copy, and drafts saved only when the author chooses. "Story Bible" became the Glossary, filled by Scan to Add to Glossary. The home page offers Sign in or See how it works (a 1,000-word demo that saves nothing). Added SECURITY.md, a live security test page, Shipping and Ask me first sections in AGENTS.md, and PRD v3.</li>
           <li><strong>Security test:</strong> a second account tried to list, read, overwrite, edit and delete the first account's work, and a signed-out visitor tried to read the data and use the AI. All were refused (screenshot submitted).</li>
-          <li><strong>What broke / changed in PRD:</strong> Supabase's built-in email allows only 2 emails an hour, so magic-link sign-in wasn't practical; I switched to email + password with confirmation off. The AI function name came out as <code>smart-task</code> instead of the name I planned, and the app was updated to match. A stray backslash typed into the code broke the whole app once; that became a rule in AGENTS.md. The PRD moved from approving or dismissing suggestions to choosing between options that fix the text.</li>
-          <li><strong>Cost & time this week:</strong> $0 new spend (Supabase free tier; existing ChatGPT and Claude subscriptions; OpenRouter credit from Build 2). Time: [add your hours].</li>
+          <li><strong>What broke / changed in PRD:</strong> Supabase's built-in email allows only 2 emails an hour, so magic-link sign-in wasn't practical; I switched to email + password with confirmation off. The AI function name came out as <code>smart-task</code> instead of the name I planned, and the app was updated to match. A stray backslash typed into the code broke the whole app once; that became a rule in AGENTS.md. On the live site, one review asked the AI for grammar and conflicts at once and it returned only grammar fixes, so I split it into two focused requests. A bug also switched the AI off after a page refresh; it was fixed and retested live. The PRD moved from approving or dismissing suggestions to choosing between options that fix the text.</li>
+          <li><strong>Cost & time this week:</strong> $0 new spend (Supabase free tier; existing ChatGPT and Claude subscriptions; OpenRouter credit from Build 2). Time: about 7 hours.</li>
         </ul>
       </div>
 
