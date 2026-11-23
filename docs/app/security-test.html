@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Margins · Security test</title>
+<style>
+  :root { --bg:#120f24; --card:#1d1838; --border:#3a3266; --text:#ece9ff; --muted:#a8a2cc; --ok:#4ade80; --bad:#f87171; --acc:#8b5cf6; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:760px; margin:0 auto; padding:24px 16px 60px; }
+  h1 { font-size:24px; margin:0 0 4px; } p { color:var(--muted); }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:16px; margin:16px 0; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; } @media (max-width:560px) { .grid { grid-template-columns:1fr; } }
+  label { display:block; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:8px 0 4px; }
+  input { width:100%; font:inherit; color:var(--text); background:#15112b; border:1px solid var(--border); border-radius:9px; padding:8px 10px; }
+  button { font:inherit; font-weight:600; color:#fff; background:linear-gradient(90deg,#7c3aed,#4f6cf7); border:0; border-radius:10px; padding:11px 18px; width:100%; margin-top:14px; cursor:pointer; }
+  button:disabled { opacity:.5; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  td { padding:9px 6px; border-top:1px solid var(--border); vertical-align:top; }
+  .tag { font-weight:700; font-size:12px; padding:3px 8px; border-radius:6px; white-space:nowrap; }
+  .pass { background:rgba(74,222,128,.15); color:var(--ok); } .fail { background:rgba(248,113,113,.15); color:var(--bad); }
+  .why { color:var(--muted); font-size:12.5px; display:block; margin-top:2px; word-break:break-word; }
+  .sum { font-size:18px; font-weight:700; margin:0 0 6px; } .stamp { color:var(--muted); font-size:12.5px; }
+  a { color:#b9a6ff; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Margins security test</h1>
+  <p>This page proves one account can't see or change another account's work. Account A saves a private note. Then Account B and a signed-out visitor try to read, overwrite and delete it, and to use the AI. Every attempt should be <b>refused</b>.</p>
+  <div class="card">
+    <div class="grid">
+      <div><b>Account A (owner)</b>
+        <label for="ae">Email</label><input id="ae" type="email" autocomplete="off" placeholder="a-test@example.com" />
+        <label for="ap">Password</label><input id="ap" type="password" autocomplete="new-password" placeholder="at least 6 characters" /></div>
+      <div><b>Account B (the intruder)</b>
+        <label for="be">Email</label><input id="be" type="email" autocomplete="off" placeholder="b-test@example.com" />
+        <label for="bp">Password</label><input id="bp" type="password" autocomplete="new-password" placeholder="at least 6 characters" /></div>
+    </div>
+    <p style="font-size:13px;margin:10px 0 0">Use two test emails. If an account doesn't exist yet, this page creates it.</p>
+    <button id="run">Run security test</button>
+  </div>
+  <div class="card" id="out" hidden></div>
+  <p style="font-size:13px"><a href="./">← Back to Margins</a></p>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+const URL_ = 'https://gchfavopupbaacjbrcoh.supabase.co';
+const KEY = 'sb_publishable_H014YhcL-dqnGwVhql4O8w_KEtEqjYK';
+const FN = 'smart-task';
+const PATH = 'security-test/canary';
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+// A private client that never touches the app's own saved sign-in.
+const sb = supabase.createClient(URL_, KEY, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } });
+
+async function login(email, password) {
+  let r = await sb.auth.signInWithPassword({ email, password });
+  if (r.error && /invalid login/i.test(r.error.message)) r = await sb.auth.signUp({ email, password });
+  if (r.error) throw new Error(email + ': ' + r.error.message);
+  if (!r.data.session) throw new Error('Account created but not signed in. Turn off "Confirm email" in Supabase.');
+  return r.data.session.user.id;
+}
+const rows = [];
+function add(name, ok, why) { rows.push({ name, ok, why }); show(); }
+function show(done) {
+  const passed = rows.filter((r) => r.ok).length;
+  $('#out').hidden = false;
+  $('#out').innerHTML = (done ? `<p class="sum">${passed === rows.length ? '✅ All ' + rows.length + ' checks passed: data is locked to its owner.' : '⚠️ ' + (rows.length - passed) + ' check(s) failed.'}</p><p class="stamp">Run ${new Date().toLocaleString()} against the live Supabase project.</p>` : '<p class="stamp">Running…</p>')
+    + `<table>${rows.map((r) => `<tr><td><span class="tag ${r.ok ? 'pass' : 'fail'}">${r.ok ? (r.name.startsWith('Owner') ? 'PASS' : 'REFUSED ✓') : 'FAIL'}</span></td><td>${esc(r.name)}<span class="why">${esc(r.why)}</span></td></tr>`).join('')}</table>`;
+}
+const msg = (e) => (e && (e.message || e.code)) || 'no error';
+
+$('#run').addEventListener('click', async () => {
+  const ae = $('#ae').value.trim().toLowerCase(), be = $('#be').value.trim().toLowerCase(), ap = $('#ap').value, bp = $('#bp').value;
+  if (!ae || !be || ae === be || ap.length < 6 || bp.length < 6) { alert('Enter two different emails and passwords of at least 6 characters.'); return; }
+  rows.length = 0; $('#run').disabled = true;
+  try {
+    // 1. Owner saves and reads a private note.
+    const aId = await login(ae, ap);
+    const secret = 'Private note from Account A · ' + Date.now();
+    let r = await sb.from('docs').upsert({ user_id: aId, path: PATH, data: { secret }, updated_at: new Date().toISOString() }, { onConflict: 'user_id,path' });
+    r = r.error ? r : await sb.from('docs').select('data').eq('path', PATH).maybeSingle();
+    add('Owner (A) can save and read their own note', !r.error && r.data && r.data.data.secret === secret, r.error ? msg(r.error) : 'A read back its note.');
+    await sb.auth.signOut();
+
+    // 2. Signed-out visitor.
+    r = await sb.from('docs').select('user_id,path');
+    add('Signed-out visitor tries to read everyone\'s work', !!r.error || (r.data || []).length === 0, r.error ? 'Database said: ' + msg(r.error) : `Got ${(r.data || []).length} rows.`);
+    const f = await fetch(`${URL_}/functions/v1/${FN}`, { method: 'POST', headers: { 'Content-Type': 'application/json', apikey: KEY }, body: JSON.stringify({ prompt: 'hello' }) });
+    const fj = await f.json().catch(() => ({}));
+    add('Signed-out visitor tries to use the AI', f.status === 401 || f.status === 403, `AI function answered ${f.status}: ${fj.error || ''}`);
+
+    // 3. Account B, signed in, attacks A's note.
+    const bId = await login(be, bp);
+    r = await sb.from('docs').select('user_id,path');
+    const leaked = (r.data || []).filter((x) => x.user_id !== bId).length;
+    add('B lists all saved work', !r.error && leaked === 0, r.error ? msg(r.error) : `B saw ${(r.data || []).length} row(s), ${leaked} belonging to someone else.`);
+    r = await sb.from('docs').select('data').eq('user_id', aId).eq('path', PATH);
+    add('B reads A\'s note directly by A\'s user ID', !!r.error || (r.data || []).length === 0, r.error ? msg(r.error) : `Got ${(r.data || []).length} rows.`);
+    r = await sb.from('docs').upsert({ user_id: aId, path: PATH, data: { secret: 'HACKED by B' } }, { onConflict: 'user_id,path' });
+    add('B overwrites A\'s note (save as A)', !!r.error, r.error ? 'Database said: ' + msg(r.error) : 'Write was accepted!');
+    r = await sb.from('docs').update({ data: { secret: 'HACKED by B' } }).eq('user_id', aId).select();
+    add('B edits A\'s note', !!r.error || (r.data || []).length === 0, r.error ? msg(r.error) : `${(r.data || []).length} rows changed.`);
+    r = await sb.from('docs').delete().eq('user_id', aId).select();
+    add('B deletes A\'s work', !!r.error || (r.data || []).length === 0, r.error ? msg(r.error) : `${(r.data || []).length} rows deleted.`);
+    r = await sb.from('ai_usage').select('*');
+    add('B reads the AI usage table', !!r.error || (r.data || []).length === 0, r.error ? 'Database said: ' + msg(r.error) : `Got ${(r.data || []).length} rows.`);
+    await sb.auth.signOut();
+
+    // 4. A checks the note is untouched.
+    await login(ae, ap);
+    r = await sb.from('docs').select('data').eq('path', PATH).maybeSingle();
+    add('Owner (A) checks the note is unchanged', !r.error && r.data && r.data.data.secret === secret, r.error ? msg(r.error) : (r.data ? 'Note still reads: “' + r.data.data.secret + '”' : 'Note is missing!'));
+    await sb.auth.signOut();
+  } catch (e) { add('Test could not finish', false, msg(e)); }
+  show(true); $('#run').disabled = false;
+});
+</script>
+</body>
+</html>

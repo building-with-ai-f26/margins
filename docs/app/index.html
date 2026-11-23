@@ -7,7 +7,7 @@
   <!-- PostHog analytics (public project token, safe to publish) -->
   <script>
     !function(t,e){var o,n,p,r;e.__SV||(window.posthog=e,e._i=[],e.init=function(i,s,a){function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}}(p=t.createElement("script")).type="text/javascript",p.crossOrigin="anonymous",p.async=!0,p.src=s.api_host.replace(".i.posthog.com","-assets.i.posthog.com")+"/static/array.js",(r=t.getElementsByTagName("script")[0]).parentNode.insertBefore(p,r);var u=e;for(void 0!==a?u=e[a]=[]:a="posthog",u.people=u.people||[],u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),t||(e+=" (stub)"),e},u.people.toString=function(){return u.toString(1)+".people (stub)"},o="init capture register register_once register_for_session unregister unregister_for_session getFeatureFlag getFeatureFlagPayload isFeatureEnabled reloadFeatureFlags updateEarlyAccessFeatureEnrollment getEarlyAccessFeatures on onFeatureFlags onSessionId getSurveys getActiveMatchingSurveys renderSurvey canRenderSurvey identify setPersonProperties group resetGroups setPersonPropertiesForFlags resetPersonPropertiesForFlags setGroupPropertiesForFlags resetGroupPropertiesForFlags reset get_distinct_id getGroups get_session_id get_session_replay_url alias set_config startSessionRecording stopSessionRecording sessionRecordingStarted captureException loadToolbar get_property getSessionProperty createPersonProfile opt_in_capturing opt_out_capturing has_opted_in_capturing has_opted_out_capturing clear_opt_in_out_capturing debug".split(" "),n=0;n<o.length;n++)g(u,o[n]);e._i.push([i,s,a])},e.__SV=1)}(document,window.posthog||[]);
-    posthog.init('phc_r8uPxTa5cTtRdZFn5ydnJt3CoRiBZg7Lq5FVVD7inYzK', { api_host: 'https://us.i.posthog.com', person_profiles: 'identified_only' });
+    posthog.init('phc_r8uPxTa5cTtRdZFn5ydnJt3CoRiBZg7Lq5FVVD7inYzK', { api_host: 'https://us.i.posthog.com', person_profiles: 'identified_only', session_recording: { maskAllInputs: true, maskTextSelector: '#read, .squote, .old, .new' } });
   </script>
 <style>
   :root { --bg:#120f2b; --card:#1d1840; --card2:#171335; --text:#ece9ff; --muted:#b3aad8; --border:#352d6b;
@@ -47,7 +47,7 @@
   .btn.small { font-size:13px; padding:5px 11px; }
   .btn.ok { background:#1f4d40; border-color:#2f7a63; }
   :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
-  input[type=text], textarea, select { font:inherit; color:var(--text); background:var(--card2); border:1px solid var(--border); border-radius:9px; padding:8px 11px; width:100%; }
+  input[type=text], input[type=password], textarea, select { font:inherit; color:var(--text); background:var(--card2); border:1px solid var(--border); border-radius:9px; padding:8px 11px; width:100%; }
   textarea { resize:vertical; }
   label.f { display:block; font-size:12px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin:8px 0 4px; }
   .pill { display:inline-block; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.06em; padding:2px 9px; border-radius:999px; background:var(--tag-bg); color:var(--tag-text); }
@@ -163,6 +163,47 @@
   .dot { width:8px; height:8px; border-radius:50%; background:#8fd3ff; flex:none; }
   .dot.high { background:var(--bad); } .dot.medium { background:var(--warn); }
   .empty-s { background:var(--card2); border:1px dashed var(--border); border-radius:12px; padding:16px; }
+  /* sign-in */
+  .who { display:flex; align-items:center; gap:10px; }
+  .who-email { font-size:13px; color:var(--text); max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .store { margin-left:auto; }
+  .signin { min-height:calc(100vh - 140px); display:grid; place-items:center; padding:40px 0; }
+  .signin-card { width:100%; max-width:440px; padding:32px; }
+  .signin-quill { display:block; width:64px; height:64px; margin:0 auto 12px; filter:drop-shadow(0 10px 24px rgba(123,92,255,.4)); }
+  .home { padding:48px 0 60px; display:grid; place-items:center; }
+  .home-card { width:100%; max-width:680px; padding:36px 40px; }
+  .home-title { text-align:center; font-size:34px; margin:0 0 8px; }
+  /* suggestions: big tabs, options, grammar fix, recent changes */
+  .tabs6 { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin:2px 0 12px; }
+  .tab6 { display:flex; justify-content:space-between; align-items:center; gap:8px; font:inherit; font-size:13.5px; font-weight:600; text-align:left;
+    background:var(--card); color:var(--text); border:1px solid var(--border); border-radius:10px; padding:10px 12px; cursor:pointer; }
+  .tab6:hover { border-color:var(--accent); }
+  .tab6.on { background:linear-gradient(135deg,var(--accent),var(--accent2)); border-color:transparent; color:#fff; box-shadow:0 6px 18px rgba(123,92,255,.35); }
+  .tab6.tab-g { grid-column:1 / -1; border-color:var(--warn); }
+  .tab6.tab-g.on { border-color:transparent; }
+  .tn { min-width:24px; text-align:center; font-size:12px; font-weight:700; padding:1px 7px; border-radius:999px; background:var(--bad); color:#fff; }
+  .tn.zero { background:transparent; color:var(--muted); border:1px solid var(--border); }
+  .tab6.on .tn { background:rgba(255,255,255,.22); color:#fff; border-color:transparent; }
+  .choose-h { font-size:13px; font-weight:600; color:var(--text); margin:4px 0 6px; }
+  .opts { display:flex; flex-direction:column; gap:6px; }
+  .opt { display:flex; align-items:center; gap:10px; font:inherit; font-size:14px; font-weight:600; text-align:left; color:var(--text); background:var(--card2); border:1px solid var(--border); border-radius:10px; padding:10px 12px; cursor:pointer; }
+  .opt:hover { border-color:var(--ok); background:#173f33; }
+  .opt small { color:var(--muted); font-weight:400; }
+  .radio { width:16px; height:16px; border-radius:50%; border:2px solid var(--muted); flex:none; }
+  .opt:hover .radio { border-color:var(--ok); background:radial-gradient(circle, var(--ok) 0 4px, transparent 5px); }
+  .gfix { display:grid; gap:6px; margin:6px 0; font:14px/1.5 Georgia,serif; }
+  .gfix > div { background:var(--card2); border-radius:8px; padding:6px 10px; }
+  .gfix small { display:block; font:600 11px/1.4 -apple-system,"Segoe UI",sans-serif; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .gfix .old { text-decoration:line-through; text-decoration-color:rgba(255,125,154,.7); }
+  .gfix .new { color:var(--ok); }
+  .linkbtn { font:inherit; font-size:12px; font-weight:600; background:none; border:0; color:#a9b8ff; cursor:pointer; padding:0; text-transform:none; letter-spacing:0; }
+  .linkbtn:hover { text-decoration:underline; }
+  .edits { max-height:180px; overflow-y:auto; display:flex; flex-direction:column; gap:4px; margin-bottom:6px; }
+  .edit { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; background:var(--card2); border:1px solid var(--border); border-radius:8px; padding:6px 8px; font-size:12.5px; }
+  .edit span { display:block; }
+  .edit small { color:var(--muted); }
+  .scard.fixed, .scard.resolved { border-color:#2f7a63; }
+  .paper-read mark.c-grammar { border-bottom-style:dotted; }
   [hidden] { display:none !important; }
 </style>
 </head>
@@ -173,16 +214,18 @@
     <nav id="nav">
       <a href="#home" data-v="home">Home</a>
       <a href="#manuscript" data-v="manuscript">Manuscript</a>
-      <a href="#story-bible" data-v="story-bible">Story Bible</a>
+      <a href="#glossary" data-v="glossary">Glossary</a>
       <a href="#history" data-v="history">History</a>
     </nav>
     <span class="store" id="store">Loading…</span>
+    <div class="who" id="who"></div>
   </div>
 </header>
 <main class="wrap" id="view"></main>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <input type="file" id="file" accept=".txt,.md,.docx" hidden />
-<script src="checker.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="checker.js"></script>
 <script src="margins.js"></script>
 </body>
 </html>

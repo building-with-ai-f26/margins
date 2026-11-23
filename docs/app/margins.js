@@ -12,7 +12,6 @@ const countWords = (t) => (String(t || '').match(/\S+/g) || []).length;
 const when = (ms) => new Date(ms).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const AI_LIMIT = 60000; // characters sent to the AI per run (~10,000 words)
-const CATS = [['characters', 'Characters'], ['plotlines', 'Plotlines'], ['timeline', 'Timeline'], ['details', 'Details & names']];
 
 const track = (ev, props) => { try { if (window.posthog && window.posthog.capture) window.posthog.capture(ev, props || {}); } catch (_) {} };
 let toastTimer;
@@ -21,9 +20,19 @@ function toast(msg) {
   clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
 }
 
-// ---------- storage: account (db) → browser (localStorage) → memory ----------
+// ---------- storage ----------
+// Where work is saved, best first: the author's Claude account (db) → the local server (server.py, saves on
+// this computer) → this browser (localStorage) → memory. Every path is prefixed with the signed-in email,
+// so each person only sees their own manuscripts, Glossary and history.
+// Live site: Supabase handles sign-in (email + password), saving (docs table, locked per account by row-level
+// security) and AI (the smart-task function, 30 requests per person per day). These two values are public by design.
+const SUPABASE_URL = 'https://gchfavopupbaacjbrcoh.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_H014YhcL-dqnGwVhql4O8w_KEtEqjYK';
+const AI_FN = 'smart-task';
+const isCloud = () => Store.mode === 'cloud' || (S.demo && Store.realMode === 'cloud');
+const emailKey = (email) => String(email).trim().toLowerCase().replace(/[^a-z0-9._@+-]/g, '-');
 const Store = {
-  mode: 'memory', db: null, uid: null, mem: {},
+  mode: 'memory', db: null, uid: null, mem: {}, ns: '',
   async init() {
     try {
       if (window.claude && claude.use) {
@@ -32,25 +41,67 @@ const Store = {
         if (id) { this.db = db; this.uid = id; this.mode = 'account'; return; }
       }
     } catch (_) { /* fall through */ }
+    try {
+      if (window.supabase && supabase.createClient && /^https?:/.test(location.protocol)) {
+        this.sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false } });
+        this.mode = 'cloud'; return;
+      }
+    } catch (_) { /* fall through */ }
+    try {
+      if (!/^https?:/.test(location.protocol)) throw 0;
+      const h = await fetch('/api/health', { cache: 'no-store' });
+      const j = h.ok ? await h.json() : null;
+      if (j && j.store) { this.mode = 'server'; return; }
+    } catch (_) { /* no local server */ }
     try { localStorage.setItem('margins:test', '1'); localStorage.removeItem('margins:test'); this.mode = 'browser'; } catch (_) { this.mode = 'memory'; }
   },
+  setUser(email) { if (this.mode === 'cloud') { this.ns = ''; return; } this.ns = email ? 'accounts/' + emailKey(email) + '/' : ''; },
   full(p) { return 'data/users/' + this.uid + '/' + p; },
-  async get(p) {
+  async api(url, body) {
+    const r = await fetch(url, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : { cache: 'no-store' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || 'Couldn’t reach the Margins server. Is python3 server.py still running?');
+    return d;
+  },
+  // raw* work on full paths; get/set/list add the signed-in user's prefix.
+  async rawGet(p) {
     if (this.mode === 'account') { const s = await this.db.doc(this.full(p)).get(); return s.exists ? clone(s.data()) : null; }
+    if (this.mode === 'cloud') { const { data, error } = await this.sb.from('docs').select('data').eq('user_id', this.uid).eq('path', p).maybeSingle(); if (error) throw new Error(error.message); return data ? data.data : null; }
+    if (this.mode === 'server') return (await this.api('/api/store?path=' + encodeURIComponent(p))).data || null;
     const raw = this.mode === 'browser' ? localStorage.getItem('margins:' + p) : this.mem[p];
     return raw ? JSON.parse(raw) : null;
   },
-  async set(p, data) {
+  async rawSet(p, data) {
     if (this.mode === 'account') return this.db.doc(this.full(p)).set(data);
+    if (this.mode === 'cloud') { const { error } = await this.sb.from('docs').upsert({ user_id: this.uid, path: p, data, updated_at: new Date().toISOString() }, { onConflict: 'user_id,path' }); if (error) throw new Error('Couldn’t save to your account: ' + error.message); return; }
+    if (this.mode === 'server') return this.api('/api/store', { path: p, data });
     const raw = JSON.stringify(data);
     if (this.mode === 'browser') localStorage.setItem('margins:' + p, raw); else this.mem[p] = raw;
   },
-  async list(col) {
+  async rawList(col) {
     if (this.mode === 'account') { const q = await this.db.collection(this.full(col)).get(); return q.docs.map((d) => ({ ...clone(d.data()), id: d.id })); }
-    const keys = this.mode === 'browser' ? Object.keys(localStorage).map((k) => k.replace(/^margins:/, '')) : Object.keys(this.mem);
+    if (this.mode === 'cloud') {
+      const pre = col + '/';
+      const { data, error } = await this.sb.from('docs').select('path,data').eq('user_id', this.uid).like('path', pre.replace(/[%_]/g, '\\$&') + '%');
+      if (error) throw new Error(error.message);
+      return (data || []).filter((r) => !r.path.slice(pre.length).includes('/')).map((r) => ({ ...r.data, id: r.path.slice(pre.length) }));
+    }
+    if (this.mode === 'server') return (await this.api('/api/store/list?col=' + encodeURIComponent(col))).items || [];
+    const keys = this.mode === 'browser' ? Object.keys(localStorage).filter((k) => k.startsWith('margins:')).map((k) => k.slice(8)) : Object.keys(this.mem);
     const pre = col + '/';
     return keys.filter((k) => k.startsWith(pre) && !k.slice(pre.length).includes('/')).map((k) => ({ ...JSON.parse(this.mode === 'browser' ? localStorage.getItem('margins:' + k) : this.mem[k]), id: k.slice(pre.length) }));
   },
+  get(p) { return this.rawGet(this.ns + p); },
+  set(p, data) { return this.rawSet(this.ns + p, data); },
+  list(col) { return this.rawList(this.ns + col); },
+};
+
+// Remembered sign-in for this browser (no password in this MVP).
+const Who = {
+  get() { try { return localStorage.getItem('margins:user') || ''; } catch (_) { return ''; } },
+  set(email) { try { email ? localStorage.setItem('margins:user', email) : localStorage.removeItem('margins:user'); } catch (_) {} },
+  recent() { try { return JSON.parse(localStorage.getItem('margins:recent') || '[]'); } catch (_) { return []; } },
+  remember(email) { try { localStorage.setItem('margins:recent', JSON.stringify([email, ...this.recent().filter((e) => e !== email)].slice(0, 5))); } catch (_) {} },
 };
 
 // ---------- state ----------
@@ -59,14 +110,18 @@ const S = {
   drafts: [], bible: { characters: [], plotlines: [] }, bibleSaved: '',
   history: [], reports: {}, text: '', reportId: null, reportTab: 'summary', reportFilter: 'open',
   busy: '', error: '', ai: null, aiSource: '', compare: null, loaded: false,
-  mode: 'edit', cat: 'all', sel: null, showResolved: false,
+  mode: 'edit', cat: 'grammar', sel: null, showResolved: false,
+  user: '', next: 'manuscript', legacy: false, demo: false,
+  edits: [], gconf: { items: [] }, savedAt: 0,
 };
+const FRESH = JSON.stringify({ meta: S.meta, drafts: [], bible: S.bible, bibleSaved: '', history: [], reports: {}, text: '', reportId: null, compare: null, mode: 'edit', cat: 'grammar', sel: null, showResolved: false, edits: [], gconf: { items: [] } });
 const currentDraft = () => S.drafts.find((d) => d.id === S.meta.currentDraftId) || S.drafts[S.drafts.length - 1] || null;
 const textDirty = () => S.text !== (currentDraft()?.text ?? '');
 const bibleDirty = () => JSON.stringify(S.bible) !== S.bibleSaved;
 
-async function load() {
-  await Store.init();
+async function loadUser() {
+  Object.assign(S, JSON.parse(FRESH));
+  Store.setUser(S.user);
   try {
     S.meta = (await Store.get('meta')) || S.meta;
     S.drafts = (await Store.list('meta/drafts')).sort((a, b) => a.n - b.n);
@@ -75,15 +130,134 @@ async function load() {
     S.bibleSaved = JSON.stringify(S.bible);
     S.history = (await Store.list('meta/history')).sort((a, b) => b.at - a.at);
     for (const r of await Store.list('meta/reports')) S.reports[r.id] = r;
-    S.text = currentDraft()?.text || '';
+    const w = await Store.get('working');
+    S.text = w && typeof w.text === 'string' ? w.text : (currentDraft()?.text || '');
+    S.edits = (w && w.edits) || [];
+    S.gconf = (await Store.get('glossaryconflicts')) || { items: [] };
     S.reportId = latestReportId();
+    // Work saved before sign-in existed: offer to move it into this account (only while this account is empty).
+    const legacy = Store.mode !== 'cloud' && !S.drafts.length && !S.history.length && !!(await Store.rawGet('meta')) && !(await Store.rawGet('legacymoved'));
+    if (legacy) return moveLegacy();
   } catch (e) {
     S.error = 'Couldn’t load your saved work. ' + (e.message || '');
   }
-  $('#store').textContent = { account: 'Saved to your account · private to you', browser: 'Saved in this browser only', memory: 'Not saved (storage unavailable)' }[Store.mode];
+}
+
+// Test run: try Margins with a sample before signing in. Kept in memory only, never saved.
+function startDemo() {
+  if (!S.demo) { Store.realMode = Store.mode; Store.mode = 'memory'; Store.mem = {}; }
+  Object.assign(S, JSON.parse(FRESH));
+  S.demo = true; S.user = ''; Store.setUser(''); setCloudAI();
+  S.text = SAMPLE; S.meta.title = 'The Partner (sample)';
+  track('demo_started');
+  location.hash = '#manuscript'; render();
+}
+const DEMO_LIMIT = 1000;
+const overLimit = () => S.demo && countWords(S.text) > DEMO_LIMIT;
+// In the demo, over 1,000 words the review buttons become "Sign in to review more than 1,000 words".
+function updateLimit() {
+  const over = overLimit();
+  document.querySelectorAll('[data-act="review"],[data-act="scan"],[data-limit]').forEach((b) => {
+    if (!b.dataset.orig) { b.dataset.orig = b.dataset.act; b.dataset.label = b.textContent; }
+    if (over) {
+      b.dataset.limit = '1';
+      if (b.dataset.orig === 'scan') { b.hidden = true; return; }
+      b.dataset.act = 'go-signin'; b.textContent = `Sign in to review more than ${DEMO_LIMIT.toLocaleString()} words`; b.disabled = false;
+    } else if (b.dataset.limit) {
+      delete b.dataset.limit; b.hidden = false; b.dataset.act = b.dataset.orig; b.textContent = b.dataset.label;
+      b.disabled = b.dataset.orig === 'review' ? !S.text.trim() : !(currentDraft() && S.ai);
+    }
+  });
+  const wc = $('#wc');
+  if (wc) { wc.textContent = countWords(S.text).toLocaleString() + ' words' + (S.demo ? ` of ${DEMO_LIMIT.toLocaleString()} in this demo` : ''); wc.style.color = over ? 'var(--bad)' : ''; }
+}
+function endDemo() { if (S.demo) { Store.mode = Store.realMode; Store.mem = {}; S.demo = false; } }
+
+// Live site AI: only for signed-in people, through the smart-task function (it checks sign-in and the daily limit).
+function setCloudAI() {
+  if (!isCloud()) return;
+  if (!S.user || S.demo) { S.ai = null; S.aiSource = ''; return; }
+  S.aiSource = 'gpt-4o-mini' + (S.aiUsed != null ? ` · ${S.aiUsed} of ${S.aiLimit} today` : '');
+  S.ai = async (prompt) => {
+    const { data, error } = await Store.sb.functions.invoke(AI_FN, { body: { prompt } });
+    if (error) {
+      let msg = 'The AI request failed.';
+      try { const j = await error.context.json(); if (j && j.error) msg = j.error; } catch (_) {}
+      throw new Error(msg);
+    }
+    S.aiUsed = data.used; S.aiLimit = data.limit; S.aiSource = `gpt-4o-mini · ${data.used} of ${data.limit} today`;
+    track('ai_call', { model: data.model, tokens_in: data.tokens_in, tokens_out: data.tokens_out, cost_usd: data.cost_usd, seconds: data.seconds });
+    return { text: data.text };
+  };
+}
+const authMsg = (e) => {
+  const m = String((e && e.message) || e || '');
+  if (/invalid login/i.test(m)) return 'That email and password don’t match. Check them, or choose “Create account” if you’re new.';
+  if (/already registered|already exists/i.test(m)) return 'There’s already an account with this email. Choose “Sign in” instead.';
+  if (/password/i.test(m) && /(least|short|weak|characters)/i.test(m)) return 'Please use a password with at least 6 characters.';
+  if (/rate limit|too many/i.test(m)) return 'Too many tries. Wait a minute and try again.';
+  return m || 'Sign-in didn’t work. Please try again.';
+};
+
+async function signIn(email, password, create) {
+  const carry = S.demo ? { text: S.text, title: S.meta.title } : null;
+  if (isCloud() && password !== undefined) {
+    const sb = Store.sb, em = email.trim().toLowerCase();
+    const { data, error } = create ? await sb.auth.signUp({ email: em, password }) : await sb.auth.signInWithPassword({ email: em, password });
+    if (error) throw new Error(authMsg(error));
+    if (!data.session) throw new Error('Your account was created, but email confirmation is turned on in Supabase. Turn off “Confirm email”, then sign in.');
+    Store.uid = data.session.user.id;
+    S.createMode = false;
+    if (create) track('account_created');
+  }
+  endDemo();
+  S.user = email.trim().toLowerCase();
+  Who.set(S.user); Who.remember(S.user);
+  await loadUser();
+  setCloudAI();
+  track('signed_in', { returning: S.drafts.length > 0, storage: Store.mode });
+  if (carry && !S.drafts.length && !S.text.trim()) { S.text = carry.text; S.meta.title = S.meta.title || carry.title; }
+  if (S.wantSample && !S.text.trim()) { S.text = SAMPLE; S.meta.title = S.meta.title || 'The Partner (sample)'; }
+  S.wantSample = false;
+  location.hash = '#' + (S.next || 'manuscript');
+  render();
+}
+function signOut() {
+  if (bibleDirty() && !S.confirmOut) { S.confirmOut = true; toast('You have unsaved Glossary edits. Click Sign out again to sign out anyway.'); setTimeout(() => (S.confirmOut = false), 5000); return; }
+  S.confirmOut = false; S.user = ''; Who.set(''); Store.setUser('');
+  if (Store.mode === 'cloud') { Store.sb.auth.signOut().catch(() => {}); Store.uid = null; }
+  Object.assign(S, JSON.parse(FRESH));
+  setCloudAI();
+  track('signed_out');
+  location.hash = '#home'; render();
+}
+async function moveLegacy() {
+  const prev = Store.ns; Store.setUser('');
+  const meta = await Store.get('meta'), bible = await Store.get('bible');
+  const lists = {};
+  for (const c of ['meta/drafts', 'meta/history', 'meta/reports']) lists[c] = await Store.list(c);
+  Store.ns = prev;
+  if (meta) await Store.set('meta', meta);
+  if (bible) await Store.set('bible', bible);
+  for (const [c, items] of Object.entries(lists)) for (const { id, ...body } of items) await Store.set(c + '/' + id, body);
+  await Store.rawSet('legacymoved', { at: Date.now() });
+  await loadUser();
+}
+
+const STORE_LABEL = { cloud: 'Saved to your Margins account', account: 'Saved to your Claude account', server: 'Saved on this computer', browser: 'Saved in this browser', memory: 'Not saved (storage unavailable)' };
+async function load() {
+  await Store.init();
+  if (Store.mode === 'cloud') {
+    // Signed in only if Supabase has a live session for this browser.
+    try { const { data } = await Store.sb.auth.getSession(); const u = data.session && data.session.user; S.user = u ? u.email : ''; Store.uid = u ? u.id : null; } catch (_) { S.user = ''; }
+    Who.set(S.user);
+  } else S.user = Who.get();
+  if (S.user) await loadUser();
+  setCloudAI();
   try { S.ai = window.claude && claude.use ? await claude.use('sample') : null; if (S.ai) S.aiSource = 'Claude'; } catch (_) { S.ai = null; }
-  if (!S.ai) {
+  if (!S.ai && Store.mode !== 'cloud') {
     try {
+      if (!/^https?:/.test(location.protocol)) throw 0;
       const h = await fetch('/api/health', { cache: 'no-store' });
       const j = h.ok ? await h.json() : null;
       if (j && j.ai) {
@@ -111,6 +285,8 @@ async function busy(label, fn) {
 }
 
 // ---------- versions ----------
+// Drafts are saved only when the author clicks "Update history".
+// Between drafts, the current text is auto-saved as a working copy, with a log of applied fixes for undo.
 async function saveDraft(note) {
   const n = S.drafts.reduce((m, d) => Math.max(m, d.n), 0) + 1;
   const d = { n, note: note || '', text: S.text, words: countWords(S.text), createdAt: Date.now() };
@@ -120,7 +296,22 @@ async function saveDraft(note) {
   S.drafts.push({ ...d, id });
   S.meta.currentDraftId = id;
   await Store.set('meta', S.meta);
+  await saveWorking(true);
   return { ...d, id };
+}
+
+let workingTimer;
+async function saveWorking(now) {
+  clearTimeout(workingTimer);
+  const write = async () => {
+    try {
+      await Store.set('working', { text: S.text, draftId: S.meta.currentDraftId || null, updatedAt: Date.now(), edits: S.edits.slice(0, 50) });
+      S.savedAt = Date.now(); const el = $('#autosave'); if (el) el.textContent = 'Auto-saved';
+    } catch (e) { const el = $('#autosave'); if (el) el.textContent = 'Couldn’t auto-save'; }
+  };
+  if (now) return write();
+  const el = $('#autosave'); if (el) el.textContent = 'Saving…';
+  workingTimer = setTimeout(write, 900);
 }
 
 async function commitBible(note, source) {
@@ -151,39 +342,120 @@ async function askAI(prompt) {
   }
 }
 const clip = (t) => (t.length > AI_LIMIT ? t.slice(0, AI_LIMIT) : t);
+const reEsc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // Find a quote in the text, ignoring case, spacing and curly quotes. Returns the exact text or null.
 function locate(text, quote) {
   if (!quote) return null;
   if (text.includes(quote)) return quote;
   const norm = (s) => s.replace(/[’‘]/g, "'").replace(/[“”]/g, '"');
-  const ws = norm(quote).split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const ws = norm(quote).split(/\s+/).filter(Boolean).map(reEsc);
   if (!ws.length) return null;
   const m = new RegExp(ws.join('\\s+'), 'i').exec(norm(text));
   return m ? text.slice(m.index, m.index + m[0].length) : null;
 }
 
+// ---------- applying fixes to the text, with undo ----------
+// A fix is { find, replace } (first match) or { find, replace, all: true } (every whole-word match).
+// Each change is recorded as { at, old, new } so it can be undone exactly.
+function applyFixes(fixes) {
+  const ops = [];
+  for (const fx of fixes || []) {
+    if (!fx || !fx.find || fx.find === fx.replace) continue;
+    if (fx.all) {
+      const re = new RegExp('\\b' + reEsc(fx.find) + '\\b', 'g');
+      let cursor = 0, m;
+      while ((re.lastIndex = cursor, m = re.exec(S.text))) {
+        S.text = S.text.slice(0, m.index) + fx.replace + S.text.slice(m.index + m[0].length);
+        ops.push({ at: m.index, old: m[0], new: fx.replace });
+        cursor = m.index + fx.replace.length;
+      }
+    } else {
+      const exact = locate(S.text, fx.find); if (!exact) continue;
+      const at = S.text.indexOf(exact);
+      // keep the author's capitalisation at the start of the replaced words
+      let rep = String(fx.replace);
+      if (/^[A-Z]/.test(exact) && /^[a-z]/.test(rep) && exact.toLowerCase().startsWith(rep.slice(0, 1).toLowerCase())) rep = rep[0].toUpperCase() + rep.slice(1);
+      S.text = S.text.slice(0, at) + rep + S.text.slice(at + exact.length);
+      ops.push({ at, old: exact, new: rep });
+    }
+  }
+  return ops;
+}
+function recordEdit(title, ops, link) {
+  const ed = { id: newId(), at: Date.now(), title, ops, link: link || null };
+  S.edits.unshift(ed); S.edits = S.edits.slice(0, 50);
+  return ed;
+}
+function undoEdit(eid) {
+  const ed = S.edits.find((x) => x.id === eid); if (!ed) return false;
+  let ok = true;
+  for (const op of [...ed.ops].reverse()) {
+    let at = S.text.substr(op.at, op.new.length) === op.new ? op.at : S.text.indexOf(op.new, Math.max(0, op.at - 300));
+    if (at < 0) at = S.text.indexOf(op.new);
+    if (at < 0) { ok = false; continue; }
+    S.text = S.text.slice(0, at) + op.old + S.text.slice(at + op.new.length);
+  }
+  S.edits = S.edits.filter((x) => x.id !== eid);
+  // the suggestion this change came from goes back to open
+  const f = findItem(ed.link); if (f) { f.status = 'open'; delete f.chosen; persistItems(f); }
+  return ok;
+}
+
+// ---------- Glossary scan ----------
+const GFIELDS = ['role', 'age', 'eyes', 'hair'];
 async function scanBible() {
-  const d = currentDraft();
-  if (!d) throw new Error('Save your manuscript first.');
-  const prompt = `You are building a story bible for a fiction manuscript. List its characters and plotlines.
+  if (overLimit()) throw new Error(`In the demo you can scan up to ${DEMO_LIMIT.toLocaleString()} words. Sign in to scan more.`);
+  if (!S.text.trim()) throw new Error('Add your manuscript first.');
+  const text = S.text;
+  const scan = await askAI(`You are building a Glossary for a fiction manuscript: its characters and plotlines.
 Only use facts stated in the text. Leave a field as "" if the text doesn't say. At most 25 characters and 10 plotlines. Notes: one short sentence.
+Also list CONFLICTS: a character fact (age, eyes, hair, role) that the text states in two different ways, or that differs from the existing Glossary below.
+For each conflict give one option per version, each with the value and the exact words from the text that state it ("quote", copied character for character; use "" for a value that comes only from the existing Glossary).
+Do not list a fact as a conflict if it is only stated once and agrees with the Glossary.
 Reply with JSON only, exactly this shape:
 {"characters":[{"name":"","aliases":[],"role":"","age":"","eyes":"","hair":"","notes":""}],
- "plotlines":[{"title":"","summary":"","status":"open","keyEvents":[""]}]}
+ "plotlines":[{"title":"","summary":"","status":"open","keyEvents":[""]}],
+ "conflicts":[{"name":"character name","field":"age|eyes|hair|role","title":"short heading","options":[{"value":"","quote":""}]}]}
 status is "open" or "resolved".
+
+Existing Glossary:
+${JSON.stringify(S.bible)}
 
 Manuscript:
 """
-${clip(d.text)}
-"""`;
-  const scan = await askAI(prompt);
+${clip(text)}
+"""`);
+
+  // 1. conflicts (checked first, so conflicting fields are not filled in yet)
+  const items = [];
+  const blocked = new Set();
+  for (const c of scan.conflicts || []) {
+    if (!c || !c.name || !GFIELDS.includes(c.field)) continue;
+    const opts = (c.options || []).map((o) => ({ value: String(o.value || '').trim(), quote: o.quote ? locate(text, String(o.quote)) : null })).filter((o) => o.value);
+    const values = [...new Set(opts.map((o) => o.value.toLowerCase()))];
+    if (values.length < 2) continue;
+    blocked.add(c.name.toLowerCase() + '|' + c.field);
+    items.push(glossaryConflict(c.name, c.field, opts, c.title));
+  }
+  // 2. merge characters and plotlines; a scanned value that differs from the Glossary is also a conflict
   let added = 0, filled = 0;
   for (const c of scan.characters || []) {
     if (!c || !c.name) continue;
     const ex = findChar(c.name) || (c.aliases || []).map(findChar).find(Boolean);
-    if (!ex) { S.bible.characters.push(normChar(c)); added++; continue; }
-    for (const f of ['role', 'age', 'eyes', 'hair', 'notes']) if (!ex[f] && c[f]) { ex[f] = String(c[f]); filled++; }
+    if (!ex) {
+      const nc = normChar(c);
+      for (const f of GFIELDS) if (blocked.has(nc.name.toLowerCase() + '|' + f)) nc[f] = '';
+      S.bible.characters.push(nc); added++; continue;
+    }
+    for (const f of [...GFIELDS, 'notes']) {
+      const v = String(c[f] || '').trim(); if (!v) continue;
+      if (blocked.has(ex.name.toLowerCase() + '|' + f) || blocked.has(String(c.name).toLowerCase() + '|' + f)) continue;
+      if (!ex[f]) { ex[f] = v; filled++; }
+      else if (f !== 'notes' && ex[f].toLowerCase() !== v.toLowerCase() && !ex[f].toLowerCase().includes(v.toLowerCase())) {
+        items.push(glossaryConflict(ex.name, f, [{ value: ex[f], quote: null, glossary: true }, { value: v, quote: null }], null));
+      }
+    }
     ex.aliases = [...new Set([...(ex.aliases || []), ...(c.aliases || []).map(String)])].filter((a) => a && a.toLowerCase() !== ex.name.toLowerCase());
   }
   for (const p of scan.plotlines || []) {
@@ -192,98 +464,206 @@ ${clip(d.text)}
     if (!ex) { S.bible.plotlines.push(normPlot(p)); added++; continue; }
     if (!ex.summary && p.summary) { ex.summary = String(p.summary); filled++; }
   }
-  await commitBible(`AI scan of Draft ${d.n}${d.text.length > AI_LIMIT ? ' (first ~10,000 words)' : ''}: ${added} added, ${filled} details filled`, 'AI scan');
-  toast(`Story Bible updated: ${added} new, ${filled} details filled.`);
-  track('bible_scanned', { added, filled });
-  location.hash = '#story-bible';
+  await commitBible(`Scan to Add to Glossary${text.length > AI_LIMIT ? ' (first ~10,000 words)' : ''}: ${added} added, ${filled} details filled${items.length ? `, ${items.length} conflict${items.length === 1 ? '' : 's'} to resolve` : ''}`, 'Scan');
+  S.gconf = { items };
+  await Store.set('glossaryconflicts', S.gconf);
+  track('glossary_scanned', { added, filled, conflicts: items.length });
+  if (items.length) {
+    toast(`Glossary updated. ${items.length === 1 ? '1 conflict needs' : items.length + ' conflicts need'} your choice.`);
+    S.cat = 'glossary'; S.mode = 'review'; S.sel = items[0].id; location.hash = '#manuscript';
+  } else {
+    toast(`Glossary updated: ${added} new, ${filled} details filled.`);
+    location.hash = '#glossary';
+  }
+}
+// A Glossary conflict: choosing an option sets the Glossary field and updates the other places in the text.
+function glossaryConflict(name, field, opts, title) {
+  const options = opts.map((o) => ({
+    label: (o.glossary ? 'Glossary: ' : '') + o.value, value: o.value,
+    fixes: opts.filter((x) => x !== o && x.quote).map((x) => ({ find: x.quote, replace: swapValue(x.quote, x.value, o.value) })).filter((fx) => fx.replace !== fx.find),
+  }));
+  return { id: newId(), source: 'Glossary scan', category: 'glossary', title: title || `${name}'s ${field}`, severity: 'high',
+    explanation: `${name}'s ${field} is given as ${opts.map((o) => `"${o.value}"${o.glossary ? ' (Glossary)' : ''}`).join(' and ')}. Choose the correct one: it is saved to the Glossary and the text is updated to match.`,
+    quotes: opts.map((o) => o.quote).filter(Boolean), options, target: { name, field }, status: 'open' };
 }
 const findChar = (name) => S.bible.characters.find((x) => [x.name, ...(x.aliases || [])].some((n) => n && n.toLowerCase() === String(name).toLowerCase()));
 const normChar = (c) => ({ id: newId(), name: String(c.name || 'New character'), aliases: (c.aliases || []).map(String), role: String(c.role || ''), age: String(c.age || ''), eyes: String(c.eyes || ''), hair: String(c.hair || ''), notes: String(c.notes || '') });
 const normPlot = (p) => ({ id: newId(), title: String(p.title || 'New plotline'), summary: String(p.summary || ''), status: p.status === 'resolved' ? 'resolved' : 'open', keyEvents: (p.keyEvents || []).map(String).filter(Boolean) });
 
-const RULE_CAT = { 'place-visit': 'timeline', 'never-met': 'timeline', 'after-death': 'timeline', 'eye-colour': 'characters', 'hair-colour': 'characters', age: 'characters', 'only-child': 'characters', 'name-spelling': 'details' };
+// ---------- numbers and values inside a quote ----------
+const W1 = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
+const W10 = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+const toWords = (n) => (n < 20 ? W1[n] : W10[Math.floor(n / 10)] + (n % 10 ? '-' + W1[n % 10] : ''));
+// Replace one value with another inside a quote: works for words ("blue" → "green") and ages (36 → 34, "thirty-six" → "thirty-four").
+function swapValue(quote, from, to) {
+  const f = String(from).trim(), t = String(to).trim();
+  if (/^\d{1,2}$/.test(f) && /^\d{1,2}$/.test(t)) {
+    if (new RegExp('\\b' + f + '\\b').test(quote)) return quote.replace(new RegExp('\\b' + f + '\\b'), t);
+    const wf = toWords(+f), wt = toWords(+t);
+    const m = new RegExp('\\b' + reEsc(wf).replace('-', '[- ]') + '\\b', 'i').exec(quote);
+    if (m) return quote.slice(0, m.index) + (/^[A-Z]/.test(m[0]) ? wt[0].toUpperCase() + wt.slice(1) : wt) + quote.slice(m.index + m[0].length);
+    return quote;
+  }
+  const re = new RegExp('\\b' + reEsc(f) + '\\b', 'i');
+  const m = re.exec(quote);
+  if (!m) return quote;
+  const out = /^[A-Z]/.test(m[0]) ? t[0].toUpperCase() + t.slice(1) : t;
+  return quote.slice(0, m.index) + out + quote.slice(m.index + m[0].length);
+}
+
+// ---------- review ----------
+const RULE_CAT = { 'place-visit': 'timeline', 'never-met': 'characters', 'after-death': 'timeline', 'eye-colour': 'characters', 'hair-colour': 'characters', age: 'characters', 'only-child': 'characters', 'name-spelling': 'details' };
+// Turn a rule-check finding into a suggestion with "which one is correct?" options where possible.
+function ruleItem(f, text) {
+  const quotes = f.spans.map((s) => text.slice(s.start, s.end));
+  let options = null;
+  if (f.rule === 'eye-colour' || f.rule === 'hair-colour') {
+    const [a, b] = f.spans.map((s) => s.label);
+    const feat = f.rule === 'eye-colour' ? 'eyes' : 'hair';
+    options = [[a, b, 1], [b, a, 0]].map(([keep, drop, i]) => ({ label: `${keep[0].toUpperCase() + keep.slice(1)} ${feat}`, fixes: [{ find: quotes[i], replace: swapValue(quotes[i], drop, keep) }] }));
+  } else if (f.rule === 'age') {
+    const [a, b] = f.spans.map((s) => s.label.replace('age ', ''));
+    options = [[a, b, 1], [b, a, 0]].map(([keep, drop, i]) => ({ label: `Age ${keep}`, fixes: [{ find: quotes[i], replace: swapValue(quotes[i], drop, keep) }] }));
+  } else if (f.rule === 'name-spelling') {
+    const common = f.spans[0].label, rare = f.spans[f.spans.length - 1].label;
+    options = [{ label: `Spell it "${common}"`, fixes: [{ find: rare, replace: common, all: true }] }, { label: `Spell it "${rare}"`, fixes: [{ find: common, replace: rare, all: true }] }];
+  }
+  if (options) options = options.filter((o) => o.fixes.every((fx) => fx.find !== fx.replace));
+  return { id: newId(), source: 'Rule check', category: RULE_CAT[f.rule] || 'details', title: f.title, explanation: f.explanation,
+    severity: f.confidence === 'likely' ? 'high' : 'medium', quotes, options: options && options.length >= 2 ? options : null, status: 'open' };
+}
 
 async function runReview() {
   if (!S.text.trim()) throw new Error('Add your manuscript first.');
-  if (textDirty()) await saveDraft('Saved before review');
-  const d = currentDraft();
-  const findings = window.MarginsChecker.analyze(d.text).map((f) => ({
-    id: newId(), source: 'Rule check', category: RULE_CAT[f.rule] || 'details', title: f.title, explanation: f.explanation,
-    severity: f.confidence === 'likely' ? 'high' : 'medium', quotes: f.spans.map((s) => d.text.slice(s.start, s.end)), bibleUpdate: null, status: 'open',
-  }));
+  if (overLimit()) throw new Error(`In the demo you can review up to ${DEMO_LIMIT.toLocaleString()} words. Sign in to review more.`);
+  const text = S.text;
+  let items = window.MarginsChecker.analyze(text).map((f) => ruleItem(f, text));
   let aiUsed = false, dropped = 0, aiNote = '';
   if (S.ai) {
     try {
-      const out = await askAI(`You are a continuity editor for fiction. Compare the manuscript with the author's Story Bible (facts the author has confirmed) and with itself.
-Find contradictions about characters (names, ages, appearance, family, relationships), plotlines (threads dropped, resolved twice, events out of order), timeline, and small details.
-Do not comment on style, grammar or plot quality. Never rewrite the text. Do not invent problems. At most 15 findings.
-Every finding must quote the exact conflicting words from the manuscript, copied character for character.
-If approving the finding should record a fact in the Story Bible, give it in "bibleUpdate" (the value most consistent with the rest of the manuscript), otherwise null.
-Reply with JSON only:
-{"findings":[{"category":"characters|plotlines|timeline|details","title":"short heading","explanation":"one or two plain sentences","severity":"high|medium|low","quotes":["exact words"],
- "bibleUpdate":null}]}
-bibleUpdate, when used, is {"kind":"character","name":"","field":"age|eyes|hair|role|notes","value":""} or {"kind":"plotline","title":"","field":"status|summary","value":""}.
+      const out = await askAI(`You are a careful copy editor and continuity editor for fiction. Report ONLY real problems in the manuscript below.
 
-Story Bible:
+1. "grammar": spelling, grammar and punctuation errors. Give the exact wrong words in "find" (short, with just enough context to be unique) and the corrected words in "replace". Respect the author's voice: do not change dialect in dialogue, deliberate fragments, or style choices.
+
+2. "characters", "plot", "timeline", "details": CONFLICTS ONLY, meaning two or more places that cannot both be true (e.g. green eyes in one place and blue eyes in another; age 34 then 36 with no time passing; a character who died later appears alive; a plot thread resolved twice; events in an impossible order; a name spelled two ways), or text that contradicts the author's Glossary below.
+   Do NOT report a fact that is simply stated, something that is only unexplained, or a style opinion.
+   For each conflict give "options": one per version of the truth, each with a short "label" (e.g. "Green eyes") and "fixes": the edits that make the whole text agree with that option, each {"find": exact words from the text, "replace": the corrected words}.
+
+Every "quotes" entry and every "find" must be copied character for character from the manuscript. At most 20 items. If there are none, return an empty list.
+Reply with JSON only:
+{"items":[{"category":"grammar","title":"","explanation":"","find":"","replace":""},
+ {"category":"characters|plot|timeline|details","title":"","explanation":"","severity":"high|medium|low","quotes":["",""],"options":[{"label":"","fixes":[{"find":"","replace":""}]}]}]}
+
+Glossary (facts the author has confirmed):
 ${JSON.stringify(S.bible)}
 
 Manuscript:
 """
-${clip(d.text)}
+${clip(text)}
 """`);
-      for (const f of out.findings || []) {
-        const quotes = (f.quotes || []).map((q) => locate(d.text, String(q))).filter(Boolean);
-        if (!quotes.length) { dropped++; continue; } // quote not in the text: likely invented, so drop it
-        const cat = CATS.some(([k]) => k === f.category) ? f.category : 'details';
-        const u = f.bibleUpdate && f.bibleUpdate.field && f.bibleUpdate.value ? f.bibleUpdate : null;
-        findings.push({ id: newId(), source: 'AI', category: cat, title: String(f.title || 'Possible inconsistency'), explanation: String(f.explanation || ''),
-          severity: ['high', 'medium', 'low'].includes(f.severity) ? f.severity : 'medium', quotes, bibleUpdate: u, status: 'open' });
+      const ai = [];
+      for (const f of out.items || out.findings || []) {
+        const cat = f.category === 'plotlines' ? 'plot' : f.category;
+        if (cat === 'grammar') {
+          const find = locate(text, String(f.find || ''));
+          if (!find || !f.replace || find === f.replace) { dropped++; continue; }
+          ai.push({ id: newId(), source: 'AI', category: 'grammar', title: String(f.title || 'Grammar or punctuation'), explanation: String(f.explanation || ''),
+            severity: 'low', quotes: [find], fix: { find, replace: String(f.replace) }, status: 'open' });
+          continue;
+        }
+        if (!['characters', 'plot', 'timeline', 'details'].includes(cat)) { dropped++; continue; }
+        const quotes = [...new Set((f.quotes || []).map((q) => locate(text, String(q))).filter(Boolean))];
+        const options = (f.options || []).map((o) => ({ label: String(o.label || '').slice(0, 80), fixes: (o.fixes || []).map((fx) => ({ find: locate(text, String(fx.find || '')), replace: String(fx.replace ?? '') })).filter((fx) => fx.find && fx.find !== fx.replace) })).filter((o) => o.label);
+        // only real conflicts: two places in the text, or one place against the Glossary with a choice to make
+        if (!quotes.length || (quotes.length < 2 && options.length < 2)) { dropped++; continue; }
+        ai.push({ id: newId(), source: 'AI', category: cat, title: String(f.title || 'Possible conflict'), explanation: String(f.explanation || ''),
+          severity: ['high', 'medium', 'low'].includes(f.severity) ? f.severity : 'medium', quotes, options: options.length >= 2 ? options : null, status: 'open' });
       }
+      // if the AI found the same conflict as a rule check, keep the AI version (it has richer options)
+      items = items.filter((r) => !ai.some((x) => x.category !== 'grammar' && x.quotes.some((q) => r.quotes.some((rq) => q.includes(rq) || rq.includes(q)))));
+      items = items.concat(ai);
       aiUsed = true;
     } catch (e) { aiNote = e.message; }
-  } else aiNote = 'AI wasn’t available, so this report uses the free rule checks only.';
-  for (const f of findings) f.pos = f.quotes.map((q) => { const i = d.text.indexOf(q); return i < 0 ? null : [i, i + q.length]; }).filter(Boolean);
-  findings.sort((a, b) => ((a.pos[0] || [1e9])[0]) - ((b.pos[0] || [1e9])[0]));
-  const report = { draftId: d.id, draftN: d.n, createdAt: Date.now(), findings, aiUsed, dropped, aiNote, truncated: d.text.length > AI_LIMIT };
-  await Store.set('meta/reports/' + d.id, report);
-  S.reports[d.id] = { ...report, id: d.id };
-  S.reportId = d.id; S.cat = 'all'; S.showResolved = false; S.mode = 'review'; S.sel = visibleFindings()[0]?.id || null;
-  track('review_run', { findings: findings.length, ai: aiUsed, dropped, words: d.words });
-  toast(`Review done: ${findings.length} suggestion${findings.length === 1 ? '' : 's'}.`);
+  } else aiNote = 'AI wasn’t available, so this review uses the free rule checks only (no grammar or plot suggestions).';
+  const pos = (f) => { const i = text.indexOf(f.quotes[0]); return i < 0 ? 1e9 : i; };
+  items.sort((a, b) => pos(a) - pos(b));
+  const d = currentDraft();
+  const report = { draftN: d ? d.n : null, createdAt: Date.now(), findings: items, aiUsed, dropped, aiNote, truncated: text.length > AI_LIMIT, words: countWords(text) };
+  const id = newId();
+  await Store.set('meta/reports/' + id, report);
+  S.reports[id] = { ...report, id };
+  S.reportId = id; S.showResolved = false; S.mode = 'review';
+  S.cat = TABS.map(([k]) => k).find((k) => tabItems(k).some((x) => x.status === 'open')) || 'grammar';
+  S.sel = visibleFindings()[0]?.id || null;
+  track('review_run', { findings: items.length, ai: aiUsed, dropped, words: report.words });
+  toast(items.length ? `Review done: ${items.length} suggestion${items.length === 1 ? '' : 's'}.` : 'Review done: no conflicts found.');
   location.hash = '#manuscript';
 }
 
-async function setStatus(fid, status) {
-  const r = S.reports[S.reportId]; const f = r?.findings.find((x) => x.id === fid);
-  if (!f) return;
-  f.status = status;
-  if (status === 'approved' && f.bibleUpdate && !f.applied) {
-    applyUpdate(f.bibleUpdate);
-    await commitBible(`Approved: ${f.title}`, 'Approved finding');
-    f.applied = true;
-    toast('Approved. Story Bible updated.');
-  } else toast(status === 'approved' ? 'Approved.' : status === 'dismissed' ? 'Marked as not an issue.' : 'Moved back to open.');
+// ---------- acting on suggestions ----------
+function findItem(id) {
+  if (!id) return null;
+  return (S.gconf.items || []).find((x) => x.id === id) || curReport()?.findings.find((x) => x.id === id) || null;
+}
+function persistItems(f) {
+  if (f.category === 'glossary') return Store.set('glossaryconflicts', S.gconf);
+  const r = curReport(); if (!r) return;
   const { id, ...body } = r;
-  await Store.set('meta/reports/' + id, body);
-  track(status === 'approved' ? 'finding_approved' : status === 'dismissed' ? 'finding_dismissed' : 'finding_reopened', { source: f.source, category: f.category });
-  if (status !== 'open') {
-    const all = curReport().findings.filter((x) => S.cat === 'all' || x.category === S.cat), at = all.findIndex((x) => x.id === fid);
-    const next = all.slice(at + 1).find((x) => x.status === 'open') || all.find((x) => x.status === 'open');
-    S.sel = next ? next.id : null;
+  return Store.set('meta/reports/' + id, body);
+}
+function nextOpen(fid) {
+  const all = tabItems(S.cat), at = all.findIndex((x) => x.id === fid);
+  const nx = all.slice(at + 1).find((x) => x.status === 'open') || all.find((x) => x.status === 'open' && x.id !== fid);
+  S.sel = nx ? nx.id : null;
+}
+// After a fix, other open suggestions whose quoted text is gone from the manuscript are settled too.
+async function autoResolve(exceptId) {
+  const changed = new Set();
+  for (const x of [...(curReport()?.findings || []), ...(S.gconf.items || [])]) {
+    if (x.id === exceptId || x.status !== 'open' || !x.quotes?.length) continue;
+    const found = spansOf(x).length;
+    if (found < Math.min(2, x.quotes.length)) { x.status = 'resolved'; x.autoResolved = true; changed.add(x.category === 'glossary' ? 'g' : 'r'); }
   }
+  if (changed.has('g')) await Store.set('glossaryconflicts', S.gconf);
+  if (changed.has('r')) { const r = curReport(); const { id, ...body } = r; await Store.set('meta/reports/' + id, body); }
+}
+// Author chose option k (or accepted a grammar fix): change the text, record it for undo, auto-save.
+async function chooseOption(fid, k) {
+  const f = findItem(fid); if (!f) return;
+  const fixes = f.fix ? [f.fix] : (f.options?.[k]?.fixes || []);
+  const label = f.fix ? `"${f.fix.find}" → "${f.fix.replace}"` : f.options[k].label;
+  track('option_chosen', { category: catOf(f), source: f.source || '', grammar: !!f.fix });
+  const ops = applyFixes(fixes);
+  if (fixes.length && !ops.length) { toast('That text has changed since the review, so the fix couldn’t be applied. Run the review again.'); return; }
+  if (ops.length) recordEdit(`${f.title}: ${label}`, ops, f.id);
+  f.status = 'fixed'; f.chosen = f.fix ? 0 : k;
+  if (f.category === 'glossary' && f.target) {
+    let c = findChar(f.target.name);
+    if (!c) { c = normChar({ name: f.target.name }); S.bible.characters.push(c); }
+    c[f.target.field] = f.options[k].value;
+    await commitBible(`Conflict resolved: ${f.target.name} · ${f.target.field} = ${f.options[k].value}`, 'Conflict resolved');
+  }
+  await persistItems(f);
+  await autoResolve(f.id);
+  await saveWorking(true);
+  track(f.category === 'grammar' ? 'grammar_fix_applied' : 'conflict_resolved', { source: f.source, category: f.category, changes: ops.length });
+  toast(ops.length ? `Updated ${ops.length} place${ops.length === 1 ? '' : 's'} in your text.` + (f.category === 'glossary' ? ' Saved to the Glossary.' : '') : 'Marked as resolved.');
+  nextOpen(fid);
   render();
 }
-function applyUpdate(u) {
-  if (u.kind === 'plotline') {
-    let p = S.bible.plotlines.find((x) => x.title.toLowerCase() === String(u.title || '').toLowerCase());
-    if (!p) { p = normPlot({ title: u.title }); S.bible.plotlines.push(p); }
-    p[u.field === 'status' ? 'status' : 'summary'] = u.field === 'status' ? (String(u.value).toLowerCase().includes('resolv') ? 'resolved' : 'open') : String(u.value);
-  } else {
-    let c = findChar(u.name || '');
-    if (!c) { c = normChar({ name: u.name }); S.bible.characters.push(c); }
-    const f = ['age', 'eyes', 'hair', 'role', 'notes'].includes(u.field) ? u.field : 'notes';
-    c[f] = String(u.value);
+async function setStatus(fid, status) {
+  const f = findItem(fid); if (!f) return;
+  track('suggestion_' + status, { category: catOf(f), source: f.source || '' });
+  if (status === 'open' && f.status === 'fixed') {
+    const ed = S.edits.find((x) => x.link === fid);
+    if (ed) { undoEdit(ed.id); await saveWorking(true); toast('Change undone.'); render(); return; }
   }
+  f.status = status;
+  await persistItems(f);
+  track(status === 'dismissed' ? 'finding_dismissed' : status === 'resolved' ? 'finding_resolved' : 'finding_reopened', { source: f.source, category: f.category });
+  toast(status === 'dismissed' ? 'Marked as not an issue.' : status === 'resolved' ? 'Marked as resolved.' : 'Moved back to open.');
+  if (status !== 'open') nextOpen(fid);
+  render();
 }
 
 // ---------- compare ----------
@@ -327,30 +707,30 @@ function viewHome() {
     <div>
       <span class="pill">For emerging &amp; self-publishing authors</span>
       <h1 style="margin-top:14px">Keep your story consistent, from the first page to the last.</h1>
-      <p class="lead">Margins reads your manuscript, builds a Story Bible of your characters and plotlines, and flags continuity slips in a clear report that you approve. It never rewrites your words.</p>
+      <p class="lead">Margins reads your manuscript, builds a Glossary of your characters and plotlines, and finds grammar slips and places where your story contradicts itself. It only changes your text when you choose a fix.</p>
       <div class="row">
-        <a class="btn" href="#manuscript">Start with your manuscript →</a>
-        <button class="btn sec" data-act="sample">Try a sample manuscript</button>
+        ${S.user ? `<a class="btn" href="#manuscript">Open your manuscript →</a>` : `<button class="btn" data-act="go-signin">Sign in →</button>
+        <button class="btn sec" data-act="test-run">See how it works</button>`}
       </div>
     </div>
     ${QUILL}
   </section>
   <div class="grid" style="margin-bottom:20px">
-    <div class="card feature"><h3><span class="ic">✦</span>Story Bible</h3><p class="muted small">Characters and plotlines pulled from your manuscript by AI. Edit anything, and every change is kept.</p></div>
+    <div class="card feature"><h3><span class="ic">✦</span>Glossary</h3><p class="muted small">Characters and plotlines pulled from your manuscript by AI. Conflicts are flagged for you to settle, and every change is kept.</p></div>
     <div class="card feature"><h3><span class="ic">⟲</span>Version history</h3><p class="muted small">Save drafts as you revise, see exactly what changed, and restore any earlier version.</p></div>
-    <div class="card feature"><h3><span class="ic">▤</span>Tabbed report</h3><p class="muted small">Findings sorted into Characters, Plotlines, Timeline and Details, each with the quoted evidence.</p></div>
-    <div class="card feature"><h3><span class="ic">✓</span>You approve</h3><p class="muted small">Approve or dismiss each finding. Approving can record the right fact in your Story Bible.</p></div>
+    <div class="card feature"><h3><span class="ic">▤</span>Tabbed suggestions</h3><p class="muted small">Grammar &amp; punctuation, Characters, Plot, Timeline and Details &amp; names, each with the quoted evidence.</p></div>
+    <div class="card feature"><h3><span class="ic">✓</span>You choose the fix</h3><p class="muted small">Green eyes or blue? Pick the right version and Margins updates your text. Every change can be undone.</p></div>
   </div>
   <div class="card" id="how">
     <h2>How Margins works</h2>
     <ol class="steps">
-      <li><b>Add your manuscript.</b> <span class="muted">On the Manuscript tab, upload a .docx or .txt file or paste your text. Click <i>Update history</i> to save it as a draft.</span></li>
-      <li><b>Build your Story Bible.</b> <span class="muted">Click <i>Scan for characters &amp; plotlines</i>. Review and edit them, then click <i>Update history</i> to save your changes.</span></li>
-      <li><b>Run a continuity review.</b> <span class="muted">Margins checks the manuscript against itself and your Story Bible, using AI plus free rule checks. Problems are highlighted in your text.</span></li>
-      <li><b>Work through the suggestions.</b> <span class="muted">The Suggestions panel has tabs for Characters, Plotlines, Timeline and Details. Step through them with the arrows, and click ✓ to approve (and record the right fact) or ✕ if it's not an issue.</span></li>
-      <li><b>Revise and track.</b> <span class="muted">Edit and save new versions. History shows every draft and Story Bible change, side by side, with restore.</span></li>
+      <li><b>Sign in and add your manuscript.</b> <span class="muted">Sign in with your email. Then, on the Manuscript tab, upload a .docx or .txt file or paste your text and click <i>Update history</i> to save it as a draft.</span></li>
+      <li><b>Build your Glossary.</b> <span class="muted">Click <i>Scan to Add to Glossary</i>. Characters and plotlines are added automatically; any conflicts appear in a Glossary conflicts tab for you to settle.</span></li>
+      <li><b>Run a review.</b> <span class="muted">Margins checks grammar and looks for places where your story contradicts itself or your Glossary. Each one is highlighted in your text.</span></li>
+      <li><b>Work through the suggestions.</b> <span class="muted">The Suggestions panel has tabs for Grammar &amp; punctuation, Characters, Plot, Timeline and Details &amp; names. Choose a tab, step through with the arrows, and pick the correct version: your text is updated for you. Or mark it Not an issue.</span></li>
+      <li><b>Revise and track.</b> <span class="muted">Your work auto-saves as you go, and Recent changes lets you undo any fix. Click <i>Update history</i> to save a new draft; History shows every draft and Glossary change, with restore.</span></li>
     </ol>
-    <p class="muted small" style="margin:0">This site uses PostHog analytics, which may record visits (including session replays) to help improve Margins. ${Store.mode === 'account' ? 'Your work is saved to your account and only you can see it.' : 'Your work is saved in this browser.'} The AI reads up to about 10,000 words per run; review long books a few chapters at a time.</p>
+    <p class="muted small" style="margin:0">Want to look around first? <b>See how it works</b> opens a sample you can review without signing in (up to 1,000 words, nothing is saved). This site uses PostHog analytics, which may record visits to help improve Margins.</p>
   </div>`;
 }
 
@@ -362,46 +742,52 @@ function chapters(text) {
   return out;
 }
 const curReport = () => S.reports[S.reportId] || null;
-function ensurePos(r) {
-  for (const f of r.findings) if (!f.pos) { const d = S.drafts.find((x) => x.id === r.draftId); f.pos = d ? f.quotes.map((q) => { const i = d.text.indexOf(q); return i < 0 ? null : [i, i + q.length]; }).filter(Boolean) : []; }
+const TABS = [['grammar', 'Grammar & punctuation'], ['characters', 'Characters'], ['plot', 'Plot'], ['timeline', 'Timeline'], ['details', 'Details & names'], ['glossary', 'Glossary conflicts']];
+// Old reports used "plotlines" for plot.
+const catOf = (f) => (f.category === 'plotlines' ? 'plot' : f.category);
+function tabItems(cat) {
+  if (cat === 'glossary') return S.gconf.items || [];
+  const r = curReport(); return r ? r.findings.filter((f) => catOf(f) === cat) : [];
 }
 function visibleFindings() {
-  const r = curReport(); if (!r) return [];
-  ensurePos(r);
-  return r.findings.filter((f) => (S.cat === 'all' || f.category === S.cat) && (S.showResolved || f.status === 'open'));
+  return tabItems(S.cat).filter((f) => S.showResolved || f.status === 'open');
+}
+// Where a suggestion's quotes are in the current text (the text may have changed since the review).
+function spansOf(f) {
+  const out = [];
+  for (const q of f.quotes || []) { const i = S.text.indexOf(q); if (i >= 0) out.push([i, i + q.length]); }
+  return out;
 }
 
 function viewWorkspace() {
   const d = currentDraft(), dirty = textDirty();
-  const chs = chapters(S.mode === 'review' && curReport() ? (S.drafts.find((x) => x.id === curReport().draftId)?.text || S.text) : S.text);
+  const chs = chapters(S.text);
+  const edits = S.edits.slice(0, 8);
   const left = `<aside class="pane side">
     <div class="side-h">Manuscript</div>
     <input type="text" id="title" class="title-in" value="${esc(S.meta.title)}" placeholder="Untitled manuscript" />
-    <p class="side-meta">${d ? `Draft ${d.n} · saved ${when(d.createdAt)}` : 'Not saved yet'}<span id="dirty" style="color:var(--warn)">${dirty ? ' · unsaved changes' : ''}</span></p>
+    <p class="side-meta">${d ? `Draft ${d.n} · saved ${when(d.createdAt)}` : 'No drafts saved yet'}<span id="dirty" style="color:var(--warn)">${dirty && d ? ' · edited since' : ''}</span></p>
+    <p class="side-meta" id="autosave">${S.demo ? 'Demo · not saved' : S.text.trim() ? 'Auto-saved' : ''}</p>
     <div class="side-h small-h">Chapters</div>
     <div class="chlist">${chs.length ? chs.map((c, i) => `<button class="ch" data-act="goto-ch" data-id="${c.at}"><span>${i + 1}</span>${esc(c.title)}</button>`).join('') : '<p class="side-meta">No chapter headings found. Lines like “Chapter One” appear here.</p>'}</div>
+    <div class="side-h small-h" style="display:flex;justify-content:space-between;align-items:center">Recent changes ${S.edits.length ? `<button class="linkbtn" data-act="undo-last">Undo last</button>` : ''}</div>
+    <div class="edits">${edits.length ? edits.map((x) => `<div class="edit"><div><span>${esc(x.title)}</span><small>${when(x.at)} · ${x.ops.length} place${x.ops.length === 1 ? '' : 's'}</small></div><button class="linkbtn" data-act="undo-edit" data-id="${x.id}">Undo</button></div>`).join('') : '<p class="side-meta">Fixes you apply from Suggestions appear here, each with Undo.</p>'}</div>
     <div class="side-foot">
       <div class="row"><button class="btn sec small" data-act="upload">Upload .docx / .txt</button><button class="btn sec small" data-act="sample">Sample</button></div>
-      <label class="f" for="vnote">Save a version</label>
+      <label class="f" for="vnote">Save as a new draft</label>
       <input type="text" id="vnote" placeholder="What changed?" />
       <button class="btn small" style="width:100%;margin-top:6px" data-act="save-version" ${S.text.trim() && dirty ? '' : 'disabled'}>Update history (save Draft ${S.drafts.length ? S.drafts[S.drafts.length - 1].n + 1 : 1})</button>
       <p class="side-meta" id="wc" style="text-align:center;margin-top:10px">${countWords(S.text).toLocaleString()} words</p>
     </div>
   </aside>`;
 
-  const r = curReport();
-  let paper;
-  if (S.mode === 'review' && r) {
-    const rd = S.drafts.find((x) => x.id === r.draftId);
-    const stale = rd && rd.text !== S.text;
-    paper = (stale ? `<div class="stale">You've edited the text since this review. <button class="btn small" data-act="review">Review again</button></div>` : '') + annotated(rd ? rd.text : '', r);
-  } else {
-    paper = `<textarea id="text" class="paper-edit" placeholder="Paste your manuscript here, or drop a .docx / .txt file…&#10;&#10;Tip: start chapters on their own line, e.g. “Chapter One”, so they show in the chapter list.">${esc(S.text)}</textarea>`;
-  }
+  const hasItems = !!curReport() || (S.gconf.items || []).length > 0;
+  const paper = S.mode === 'review' && hasItems ? annotated()
+    : `<textarea id="text" class="paper-edit" placeholder="Paste your manuscript here, or drop a .docx / .txt file…&#10;&#10;Tip: start chapters on their own line, e.g. “Chapter One”, so they show in the chapter list.">${esc(S.text)}</textarea>`;
   const center = `<section class="pane center">
     <div class="center-bar">
       <b class="doc-title">${esc(S.meta.title || 'Untitled manuscript')}</b>
-      <div class="seg"><button class="${S.mode === 'edit' ? 'on' : ''}" data-act="mode" data-id="edit">Edit</button><button class="${S.mode === 'review' ? 'on' : ''}" data-act="mode" data-id="review" ${r ? '' : 'disabled'}>Review highlights</button></div>
+      <div class="seg"><button class="${S.mode === 'edit' ? 'on' : ''}" data-act="mode" data-id="edit">Edit</button><button class="${S.mode === 'review' ? 'on' : ''}" data-act="mode" data-id="review" ${hasItems ? '' : 'disabled'}>Review highlights</button></div>
     </div>
     <div class="paper-wrap" id="paper-wrap"><div class="paper dropzone" id="drop">${paper}</div></div>
   </section>`;
@@ -409,9 +795,12 @@ function viewWorkspace() {
   return `<div class="workspace">${left}${center}${suggestionsPane()}</div>`;
 }
 
-function annotated(text, r) {
+// The current text, with every open suggestion's quotes highlighted (the selected one stands out).
+function annotated() {
+  const text = S.text;
+  const items = [...(curReport()?.findings || []), ...(S.gconf.items || [])];
   const spans = [];
-  for (const f of r.findings) if (S.showResolved || f.status === 'open' || f.id === S.sel) for (const [a, b] of f.pos || []) spans.push({ a, b, f });
+  for (const f of items) if (f.status === 'open' || f.id === S.sel) for (const [a, b] of spansOf(f)) spans.push({ a, b, f });
   const lines = text.split('\n'); let off = 0, html = '';
   for (const line of lines) {
     const end = off + line.length;
@@ -424,7 +813,8 @@ function annotated(text, r) {
       const cov = inl.filter((s) => s.a <= p && s.b >= q);
       if (!cov.length) { body += piece; continue; }
       const ids = [...new Set(cov.map((s) => s.f.id))];
-      body += `<mark data-f="${ids.join(' ')}" class="${ids.includes(S.sel) ? 'sel' : ''} ${cov[0].f.severity}">${piece}</mark>`;
+      const sel = ids.includes(S.sel) ? cov.find((s) => s.f.id === S.sel).f : cov[0].f;
+      body += `<mark data-f="${ids.join(' ')}" class="${ids.includes(S.sel) ? 'sel' : ''} ${sel.severity} c-${catOf(sel)}">${piece}</mark>`;
     }
     const isCh = line.length < 80 && CHAPTER_RE.test(line);
     html += isCh ? `<h2 class="chap" data-at="${off}">${body}</h2>` : `<p data-at="${off}">${body}</p>`;
@@ -433,57 +823,69 @@ function annotated(text, r) {
   return `<div class="paper-read" id="read">${html || '<p class="muted">Nothing to show.</p>'}</div>`;
 }
 
+function suggestionCard(f) {
+  const status = f.status === 'fixed' ? `<span class="pill approved">${f.fix ? 'Fixed' : 'Fixed: ' + esc(f.options?.[f.chosen]?.label || '')}</span>`
+    : f.status === 'resolved' ? `<span class="pill approved">${f.autoResolved ? 'Settled by another fix' : 'Resolved'}</span>` : f.status === 'dismissed' ? '<span class="pill dismissed">Not an issue</span>' : '';
+  let body = '';
+  if (f.fix) {
+    body = `<div class="gfix"><div><small>Original</small><span class="old">${esc(f.fix.find)}</span></div><div><small>Suggested</small><span class="new">${esc(f.fix.replace)}</span></div></div>`;
+  } else {
+    body = f.quotes.map((q, k) => `<button class="squote" data-act="goto-q" data-id="${f.id}" data-k="${k}">“${esc(q)}”</button>`).join('');
+  }
+  let actions = '';
+  if (f.status === 'open') {
+    if (f.fix) actions = `<button class="btn ok small" data-act="choose" data-id="${f.id}" data-k="0">✓ Accept fix</button><button class="btn sec small" data-act="dismiss" data-id="${f.id}">Not an issue</button>`;
+    else if (f.options) actions = `<p class="choose-h">Which is correct? Your text will be updated to match.</p><div class="opts">${f.options.map((o, k) => `<button class="opt" data-act="choose" data-id="${f.id}" data-k="${k}"><span class="radio"></span>${esc(o.label)}${o.fixes?.length ? '' : ' <small>(no text change)</small>'}</button>`).join('')}</div>
+        <div class="row" style="margin-top:8px"><button class="btn sec small" data-act="resolve" data-id="${f.id}">I'll fix it myself</button><button class="btn sec small" data-act="dismiss" data-id="${f.id}">Not an issue</button></div>`;
+    else actions = `<button class="btn ok small" data-act="resolve" data-id="${f.id}">✓ Mark resolved</button><button class="btn sec small" data-act="dismiss" data-id="${f.id}">Not an issue</button>`;
+  } else actions = `<button class="btn sec small" data-act="reopen" data-id="${f.id}">Undo</button>`;
+  return `<div class="scard ${f.status}">
+      <div class="row" style="gap:6px"><span class="pill ${f.severity}">${f.severity}</span><span class="pill">${esc(f.source)}</span>${status}</div>
+      <h3 style="margin-top:8px">${esc(f.title)}</h3>
+      <p class="side-meta" style="font-size:14px">${esc(f.explanation)}</p>
+      ${body}
+      <div class="${f.options && f.status === 'open' ? '' : 'row'}" style="margin-top:10px">${actions}</div>
+    </div>`;
+}
+
 function suggestionsPane() {
-  const r = curReport();
-  const actions = `<div class="row" style="margin-bottom:10px">
-      <button class="btn small" data-act="review" ${S.text.trim() ? '' : 'disabled'}>Run continuity review</button>
-      <button class="btn sec small" data-act="scan" ${currentDraft() && S.ai ? '' : 'disabled'}>Scan Story Bible</button></div>
+  const r = curReport(), g = (S.gconf.items || []).length > 0;
+  const actions = `<div class="row" style="margin-bottom:8px">
+      <button class="btn small" data-act="review" ${S.text.trim() ? '' : 'disabled'}>Run review</button>
+      <button class="btn sec small" data-act="scan" ${S.text.trim() && S.ai ? '' : 'disabled'}>Scan to Add to Glossary</button></div>
     <p class="side-meta" style="margin:0 0 12px">${S.ai ? `AI ready (${esc(S.aiSource)}) · plus free rule checks` : 'AI not available here · free rule checks only'}</p>`;
-  if (!r) return `<aside class="pane sugg"><div class="sugg-h"><b>Suggestions</b></div>${actions}
-    <div class="empty-s"><p><b>No review yet.</b></p><p class="side-meta">Add your manuscript, then run a continuity review. Suggestions appear here, and the matching words are highlighted in your text.</p></div></aside>`;
-  ensurePos(r);
-  const all = r.findings, done = all.filter((f) => f.status !== 'open').length, pct = all.length ? Math.round((done / all.length) * 100) : 100;
+  if (!r && !g) return `<aside class="pane sugg"><div class="sugg-h"><b>Suggestions</b></div>${actions}
+    <div class="empty-s"><p><b>No review yet.</b></p><p class="side-meta">Run a review to find grammar slips and places where your story contradicts itself. Each one appears here, highlighted in your text, with a choice of fixes.</p></div></aside>`;
+  const tabs = TABS.filter(([k]) => k !== 'glossary' || g);
+  if (!tabs.some(([k]) => k === S.cat)) S.cat = tabs[0][0];
+  const all = [...(r?.findings || []), ...(S.gconf.items || [])], done = all.filter((f) => f.status !== 'open').length, pct = all.length ? Math.round((done / all.length) * 100) : 100;
   const list = visibleFindings();
   if (!list.some((f) => f.id === S.sel)) S.sel = list[0]?.id || null;
   const i = list.findIndex((f) => f.id === S.sel), f = list[i];
-  const cats = [['all', 'All'], ...CATS];
-  const tabs = cats.map(([k, l]) => { const n = all.filter((x) => (k === 'all' || x.category === k) && x.status === 'open').length; return `<button class="${S.cat === k ? 'on' : ''}" data-act="cat" data-id="${k}">${l}<span class="n">${n}</span></button>`; }).join('');
-  const card = f ? `<div class="scard ${f.status}">
-      <div class="row" style="justify-content:space-between">
-        <div class="row" style="gap:6px"><span class="pill ${f.severity}">${f.severity}</span><span class="pill">${esc(f.source)}</span>${f.status !== 'open' ? `<span class="pill ${f.status}">${f.status === 'approved' ? 'Approved' : 'Not an issue'}</span>` : ''}</div>
-        ${f.status === 'open' ? `<div class="row" style="gap:6px"><button class="iconbtn ok" title="Approve" data-act="approve" data-id="${f.id}">✓</button><button class="iconbtn no" title="Not an issue" data-act="dismiss" data-id="${f.id}">✕</button></div>` : `<button class="btn sec small" data-act="reopen" data-id="${f.id}">Undo</button>`}
-      </div>
-      <h3 style="margin-top:8px">${esc(f.title)}</h3>
-      <p class="side-meta" style="font-size:14px">${esc(f.explanation)}</p>
-      ${f.quotes.map((q, k) => `<button class="squote" data-act="goto-q" data-id="${f.id}" data-k="${k}">“${esc(q)}”</button>`).join('')}
-      ${f.bibleUpdate ? `<div class="upd">If approved, the Story Bible records <b>${esc(f.bibleUpdate.kind === 'plotline' ? f.bibleUpdate.title : f.bibleUpdate.name)}</b> · ${esc(f.bibleUpdate.field)} = <b>${esc(f.bibleUpdate.value)}</b>${f.applied ? ' ✓' : ''}</div>` : ''}
-    </div>` : `<div class="empty-s"><p><b>${S.showResolved ? 'Nothing in this section.' : 'All done here. 🎉'}</b></p><p class="side-meta">${S.showResolved ? '' : 'Every suggestion in this section has been reviewed.'}</p></div>`;
+  const tabHtml = tabs.map(([k, l]) => { const n = tabItems(k).filter((x) => x.status === 'open').length; return `<button class="tab6 ${S.cat === k ? 'on' : ''} ${k === 'glossary' ? 'tab-g' : ''}" data-act="cat" data-id="${k}"><span>${l}</span><span class="tn ${n ? '' : 'zero'}">${n}</span></button>`; }).join('');
   return `<aside class="pane sugg">
-    <div class="sugg-h"><b>Suggestions</b><span class="side-meta">Draft ${r.draftN} · ${when(r.createdAt)}</span></div>
+    <div class="sugg-h"><b>Suggestions</b><span class="side-meta">${r ? `${r.draftN ? 'Draft ' + r.draftN + ' · ' : ''}${when(r.createdAt)}` : ''}</span></div>
     ${actions}
-    <div class="spread side-meta"><span>${done} of ${all.length} reviewed</span><span>${pct}%</span></div>
-    <div class="progress" style="margin:4px 0 12px"><div style="width:${pct}%"></div></div>
-    <div class="ctabs">${tabs}</div>
-    <div class="pager"><button class="iconbtn" data-act="prev" ${i > 0 ? '' : 'disabled'} title="Previous">‹</button><span>${list.length ? `${i + 1} of ${list.length} suggestions` : '0 suggestions'}</span><button class="iconbtn" data-act="next" ${i >= 0 && i < list.length - 1 ? '' : 'disabled'} title="Next">›</button></div>
-    ${card}
-    <div class="slist">${list.filter((x) => x.id !== S.sel).map((x) => `<button class="srow" data-act="pick" data-id="${x.id}"><span class="dot ${x.severity}"></span><span>${esc(x.title)}</span>${x.status !== 'open' ? `<span class="pill ${x.status}" style="margin-left:auto">${x.status === 'approved' ? '✓' : '—'}</span>` : ''}</button>`).join('')}</div>
+    <div class="tabs6">${tabHtml}</div>
+    <div class="spread side-meta"><span>${done} of ${all.length} handled</span><span>${pct}%</span></div>
+    <div class="progress" style="margin:4px 0 10px"><div style="width:${pct}%"></div></div>
+    <div class="pager"><button class="iconbtn" data-act="prev" ${i > 0 ? '' : 'disabled'} title="Previous">‹</button><span>${list.length ? `${i + 1} of ${list.length}` : 'Nothing here'}</span><button class="iconbtn" data-act="next" ${i >= 0 && i < list.length - 1 ? '' : 'disabled'} title="Next">›</button></div>
+    ${f ? suggestionCard(f) : `<div class="empty-s"><p><b>${tabItems(S.cat).length ? 'All done in this tab. 🎉' : 'No conflicts found here.'}</b></p></div>`}
+    <div class="slist">${list.filter((x) => x.id !== S.sel).map((x) => `<button class="srow" data-act="pick" data-id="${x.id}"><span class="dot ${x.severity}"></span><span>${esc(x.title)}</span>${x.status !== 'open' ? `<span class="pill ${x.status === 'dismissed' ? 'dismissed' : 'approved'}" style="margin-left:auto">${x.status === 'dismissed' ? '—' : '✓'}</span>` : ''}</button>`).join('')}</div>
     <div class="spread" style="margin-top:12px">
-      <label class="side-meta" style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" data-act="resolved" ${S.showResolved ? 'checked' : ''}/> Show resolved</label>
-      <div class="row" style="gap:6px">${Object.keys(S.reports).length > 1 ? `<select id="pick-report" style="width:auto;padding:4px 6px;font-size:12px">${Object.values(S.reports).sort((a, b) => b.createdAt - a.createdAt).map((x) => `<option value="${x.id}" ${x.id === r.id ? 'selected' : ''}>Draft ${x.draftN}</option>`).join('')}</select>` : ''}<button class="btn sec small" data-act="copy-report">Copy report</button></div>
+      <label class="side-meta" style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" data-act="resolved" ${S.showResolved ? 'checked' : ''}/> Show handled</label>
+      <button class="btn sec small" data-act="copy-report">Copy report</button>
     </div>
-    ${r.dropped || r.truncated || (!r.aiUsed && r.aiNote) ? `<p class="side-meta" style="margin-top:10px">${!r.aiUsed && r.aiNote ? esc(r.aiNote) + ' ' : ''}${r.dropped ? `${r.dropped} AI suggestion(s) dropped because the quoted words weren't in your text. ` : ''}${r.truncated ? 'The AI read the first ~10,000 words.' : ''}</p>` : ''}
+    ${r && (r.dropped || r.truncated || (!r.aiUsed && r.aiNote)) ? `<p class="side-meta" style="margin-top:10px">${!r.aiUsed && r.aiNote ? esc(r.aiNote) + ' ' : ''}${r.dropped ? `${r.dropped} AI suggestion(s) were left out because they weren't real conflicts or didn't match your text. ` : ''}${r.truncated ? 'The AI read the first ~10,000 words.' : ''}</p>` : ''}
   </aside>`;
 }
 
-// Scroll the manuscript to a finding's highlight (or a chapter).
+// Scroll the manuscript to a suggestion's highlight (or a chapter).
 function scrollToMark(fid, k) {
-  const marks = [...document.querySelectorAll('#read mark')].filter((m) => m.dataset.f.split(' ').includes(fid));
-  const r = curReport(); const f = r?.findings.find((x) => x.id === fid);
-  let target = marks[0];
-  if (f && f.pos && f.pos[k || 0]) {
-    const want = f.pos[k || 0][0];
-    target = [...document.querySelectorAll('#read [data-at]')].filter((p) => +p.dataset.at <= want).pop()?.querySelector(`mark[data-f~="${fid}"]`) || target;
-  }
+  const f = findItem(fid); if (!f) return;
+  const sp = spansOf(f)[k || 0] || spansOf(f)[0];
+  let target = [...document.querySelectorAll('#read mark')].find((m) => m.dataset.f.split(' ').includes(fid));
+  if (sp) target = [...document.querySelectorAll('#read [data-at]')].filter((p) => +p.dataset.at <= sp[0]).pop()?.querySelector(`mark[data-f~="${fid}"]`) || target;
   if (target) { target.scrollIntoView({ behavior: 'smooth', block: 'center' }); target.classList.remove('flash'); void target.offsetWidth; target.classList.add('flash'); }
 }
 function gotoChapter(at) {
@@ -515,9 +917,10 @@ function viewBible() {
     </div>`).join('');
   return `
   <div class="card">
-    <div class="spread"><div><h2 style="margin:0">Story Bible</h2><p class="muted small" style="margin:0">The facts of your story. Reviews check the manuscript against them.</p></div>
-      <button class="btn sec" data-act="scan" ${currentDraft() && S.ai ? '' : 'disabled'}>Scan manuscript with AI</button></div>
+    <div class="spread"><div><h2 style="margin:0">Glossary</h2><p class="muted small" style="margin:0">The characters and plotlines of your story. Reviews check your text against them.</p></div>
+      <button class="btn" data-act="scan" ${S.text.trim() && S.ai ? '' : 'disabled'}>Scan to Add to Glossary</button></div>
   </div>
+  ${(S.gconf.items || []).some((x) => x.status === 'open') ? `<div class="card" style="border-color:var(--warn)"><div class="spread"><span><b>${S.gconf.items.filter((x) => x.status === 'open').length} conflict(s)</b> found in the last scan need your choice before they're added.</span><button class="btn small" data-act="go-gconf">Resolve conflicts →</button></div></div>` : ''}
   <div class="card" style="position:sticky;top:64px;z-index:3">
     <div class="row">
       <span class="small" style="color:${dirty ? 'var(--warn)' : 'var(--muted)'}">${dirty ? 'You have unsaved changes.' : 'All changes saved.'}</span>
@@ -527,9 +930,9 @@ function viewBible() {
     </div>
   </div>
   <div class="card"><div class="spread"><h2>Characters (${b.characters.length})</h2><button class="btn sec small" data-act="add-char">+ Add character</button></div>
-    ${chars ? `<div class="grid">${chars}</div>` : '<p class="muted">No characters yet. Scan your manuscript or add one.</p>'}</div>
+    ${chars ? `<div class="grid">${chars}</div>` : '<p class="muted">No characters yet. Click Scan to Add to Glossary, or add one.</p>'}</div>
   <div class="card"><div class="spread"><h2>Plotlines (${b.plotlines.length})</h2><button class="btn sec small" data-act="add-plot">+ Add plotline</button></div>
-    ${plots ? `<div class="grid">${plots}</div>` : '<p class="muted">No plotlines yet. Scan your manuscript or add one.</p>'}</div>`;
+    ${plots ? `<div class="grid">${plots}</div>` : '<p class="muted">No plotlines yet. Click Scan to Add to Glossary, or add one.</p>'}</div>`;
 }
 
 function viewHistory() {
@@ -547,25 +950,77 @@ function viewHistory() {
       <div class="diff">${df ? df.map((x) => x.t === 'same' ? `<div class="same">… ${x.n} unchanged paragraph${x.n > 1 ? 's' : ''} …</div>` : `<div class="${x.t}">${esc(x.s)}</div>`).join('') : '<div class="same">Too large to compare here.</div>'}</div></div>`;
   } else if (cmp?.t === 'bible') {
     const i = S.history.findIndex((x) => x.id === cmp.id), h = S.history[i], prev = S.history[i + 1];
-    panel = `<div class="card"><div class="spread"><h2>Story Bible changes: ${esc(h.note || h.source)}</h2><button class="btn sec small" data-act="close-compare">Close</button></div>
+    panel = `<div class="card"><div class="spread"><h2>Glossary changes: ${esc(h.note || h.source)}</h2><button class="btn sec small" data-act="close-compare">Close</button></div>
       <div class="diff" style="font-family:inherit">${bibleChanges(prev?.snapshot, h.snapshot)}</div></div>`;
   }
   return `${panel}<div class="card"><h2>History</h2>
-    <p class="muted small">Every saved draft and Story Bible update, newest first.</p>
+    <p class="muted small">Every saved draft and Glossary update, newest first. Fixes applied since your last draft are under Recent changes on the Manuscript tab.</p>
     ${items.length ? `<div class="tl">${items.map((x) => x.t === 'draft'
       ? `<div class="item"><div class="spread"><div><b>Draft ${x.d.n}</b> <span class="pill">Manuscript</span>${x.d.id === S.meta.currentDraftId ? ' <span class="pill approved">current</span>' : ''}<br><span class="muted small">${when(x.at)} · ${x.d.words.toLocaleString()} words${x.d.note ? ' · ' + esc(x.d.note) : ''}</span></div>
           <div class="row"><button class="btn sec small" data-act="cmp-draft" data-id="${x.d.id}">What changed</button><button class="btn sec small" data-act="open-draft" data-id="${x.d.id}">Open</button>${x.d.id === S.meta.currentDraftId ? '' : `<button class="btn sec small" data-act="restore-draft" data-id="${x.d.id}">Restore as new version</button>`}</div></div></div>`
-      : `<div class="item bible"><div class="spread"><div><b>${esc(x.h.note || 'Story Bible update')}</b> <span class="pill">Story Bible · ${esc(x.h.source)}</span><br><span class="muted small">${when(x.at)} · ${x.h.snapshot.characters.length} characters, ${x.h.snapshot.plotlines.length} plotlines</span></div>
+      : `<div class="item bible"><div class="spread"><div><b>${esc(x.h.note || 'Glossary update')}</b> <span class="pill">Glossary · ${esc(x.h.source)}</span><br><span class="muted small">${when(x.at)} · ${x.h.snapshot.characters.length} characters, ${x.h.snapshot.plotlines.length} plotlines</span></div>
           <div class="row"><button class="btn sec small" data-act="cmp-bible" data-id="${x.h.id}">What changed</button><button class="btn sec small" data-act="restore-bible" data-id="${x.h.id}">Restore this version</button></div></div></div>`).join('')}</div>`
-    : '<p class="muted">Nothing saved yet. Save your manuscript or update your Story Bible to start your history.</p>'}</div>`;
+    : '<p class="muted">Nothing saved yet. Save a draft or update your Glossary to start your history.</p>'}</div>`;
 }
 
-const VIEWS = { home: viewHome, manuscript: viewWorkspace, 'story-bible': viewBible, history: viewHistory };
-const route = () => { const h = location.hash.slice(1); return h === 'report' ? 'manuscript' : VIEWS[h] ? h : 'home'; };
+function viewSignin() {
+  if (isCloud()) return viewSigninCloud();
+  const where = { account: 'to your Claude account', server: 'on this computer (in the margins-data folder)', browser: 'in this browser', memory: 'only until you close this page' }[Store.mode];
+  const recent = Who.recent();
+  return `<div class="signin"><div class="card signin-card">
+    ${QUILL.replace('hero-quill', 'signin-quill')}
+    <h2 style="text-align:center;margin-bottom:6px">Sign in to Margins</h2>
+    <p class="muted" style="text-align:center">Enter your email to open your manuscripts, Glossary and version history.</p>
+    <form id="signin-form" novalidate>
+      <label class="f" for="email">Email</label>
+      <input type="text" id="email" inputmode="email" autocomplete="email" placeholder="you@example.com" value="${esc(S.user || recent[0] || '')}" />
+      <p class="small" id="email-err" style="color:var(--bad);margin:6px 0 0" hidden>Please enter a valid email address.</p>
+      <button class="btn" type="submit" style="width:100%;margin-top:14px">Continue →</button>
+    </form>
+    ${recent.length > 1 ? `<p class="small muted" style="margin:16px 0 6px">Recently used on this device</p><div class="row">${recent.map((e) => `<button class="btn sec small" data-act="quick-signin" data-id="${esc(e)}">${esc(e)}</button>`).join('')}</div>` : ''}
+    <p class="small muted" style="margin:18px 0 0">New email? A fresh workspace is created. Your work is saved ${where}.</p>
+    <p class="small muted" style="margin:6px 0 0"><b>Early version:</b> there's no password yet, so anyone who types your email on the same device or site can open your work. Avoid confidential manuscripts.</p>
+  </div></div>`;
+}
+
+function viewSigninCloud() {
+  const create = !!S.createMode, recent = Who.recent();
+  return `<div class="signin"><div class="card signin-card">
+    ${QUILL.replace('hero-quill', 'signin-quill')}
+    <h2 style="text-align:center;margin-bottom:6px">${create ? 'Create your Margins account' : 'Sign in to Margins'}</h2>
+    <p class="muted" style="text-align:center">Your manuscript, Glossary and version history are private to your account.</p>
+    <form id="signin-form" novalidate>
+      <label class="f" for="email">Email</label>
+      <input type="text" id="email" inputmode="email" autocomplete="email" autocapitalize="off" placeholder="you@example.com" value="${esc(S.prefill || recent[0] || '')}" />
+      <label class="f" for="pw" style="margin-top:12px">Password</label>
+      <input type="password" id="pw" autocomplete="${create ? 'new-password' : 'current-password'}" placeholder="${create ? 'At least 6 characters' : 'Your password'}" />
+      <p class="small" id="email-err" style="color:var(--bad);margin:6px 0 0" hidden></p>
+      <button class="btn" type="submit" style="width:100%;margin-top:14px">${create ? 'Create account →' : 'Sign in →'}</button>
+    </form>
+    <p class="small" style="text-align:center;margin:14px 0 0">${create ? 'Already have an account?' : 'New to Margins?'} <a href="#signin" data-act="toggle-create">${create ? 'Sign in' : 'Create an account'}</a></p>
+    ${recent.length ? `<p class="small muted" style="margin:16px 0 6px">Recently used on this device</p><div class="row">${recent.map((e) => `<button class="btn sec small" data-act="prefill" data-id="${esc(e)}">${esc(e)}</button>`).join('')}</div>` : ''}
+    <p class="small muted" style="margin:18px 0 0">Signed-in accounts get AI reviews (30 a day). Your data is locked to your account: nobody else can read or change it.</p>
+  </div></div>`;
+}
+
+const VIEWS = { home: viewHome, signin: viewSignin, manuscript: viewWorkspace, glossary: viewBible, history: viewHistory };
+const PRIVATE = ['manuscript', 'glossary', 'history'];
+const route = () => {
+  let h = location.hash.slice(1); if (h === 'report') h = 'manuscript'; if (h === 'story-bible') h = 'glossary';
+  if (!VIEWS[h]) return 'home';
+  if (PRIVATE.includes(h) && !S.user && !S.demo) { S.next = h; return 'signin'; }
+  return h;
+};
 
 function render() {
   const v = route();
   document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('on', a.dataset.v === v));
+  $('#store').textContent = S.demo ? 'Demo · not saved' : STORE_LABEL[Store.mode];
+  $('#who').innerHTML = S.demo
+    ? `<button class="btn small" data-act="go-signin">Sign in to save</button>`
+    : S.user
+    ? `<span class="who-email" title="${esc(S.user)}">${esc(S.user)}</span><button class="btn sec small" data-act="signout">Sign out</button>`
+    : (v === 'signin' ? '' : `<button class="btn small" data-act="go-signin">Sign in</button>`);
   const banner = (S.busy ? `<div class="banner"><span class="spin"></span>${esc(S.busy)}</div>` : '') + (S.error ? `<div class="banner err">${esc(S.error)}</div>` : '');
   const keepScroll = window.scrollY;
   const keep = {}; document.querySelectorAll('.pane, #paper-wrap, #text').forEach((el, i) => (keep[i] = el.scrollTop));
@@ -574,6 +1029,7 @@ function render() {
   if (S.busy) document.querySelectorAll('#view button').forEach((b) => (b.disabled = true));
   document.querySelectorAll('.pane, #paper-wrap, #text').forEach((el, i) => { if (keep[i]) el.scrollTop = keep[i]; });
   window.scrollTo(0, keepScroll);
+  updateLimit();
 }
 
 // ---------- sample ----------
@@ -614,6 +1070,7 @@ async function readFile(file) {
   else if (/\.(txt|md|text)$/i.test(file.name) || file.type.startsWith('text/')) text = await file.text();
   else throw new Error('Please upload a .docx or .txt file.');
   S.text = text.replace(/\r\n/g, '\n').trim();
+  saveWorking();
   if (!S.meta.title) S.meta.title = file.name.replace(/\.[^.]+$/, '');
   S.mode = 'edit'; location.hash = '#manuscript'; render();
   track('file_uploaded', { type: file.name.split('.').pop() });
@@ -627,26 +1084,39 @@ document.addEventListener('click', (e) => {
   const id = a.dataset.id;
   switch (a.dataset.act) {
     case 'sample':
-      if (S.text.trim() && textDirty()) { toast('Save or clear your current text first.'); return; }
-      S.text = SAMPLE; S.mode = 'edit'; if (!S.meta.title) S.meta.title = 'The Partner (sample)'; track('sample_loaded'); location.hash = '#manuscript'; render(); toast('Sample loaded. Save it as a version, then scan or review.'); break;
+      if (!S.user && !S.demo) { startDemo(); return; }
+      if (S.text.trim() && S.text !== SAMPLE && !S.confirmSample) { S.confirmSample = true; toast('This replaces your current text. Click Sample again to continue, or save a draft first.'); setTimeout(() => (S.confirmSample = false), 5000); return; }
+      S.confirmSample = false; S.text = SAMPLE; saveWorking(); S.mode = 'edit'; if (!S.meta.title) S.meta.title = 'The Partner (sample)'; track('sample_loaded'); location.hash = '#manuscript'; render(); toast('Sample loaded. Run a review or scan it into the Glossary.'); break;
     case 'upload': $('#file').click(); break;
+    case 'go-signin': S.next = 'manuscript'; location.hash = '#signin'; break;
+    case 'test-run': startDemo(); break;
+    case 'toggle-create': e.preventDefault(); S.createMode = !S.createMode; render(); break;
+    case 'prefill': S.prefill = id; render(); setTimeout(() => $('#pw')?.focus(), 0); break;
+    case 'quick-signin': busy('Opening your workspace…', () => signIn(id)); break;
+    case 'signout': signOut(); break;
     case 'save-version': busy('Saving version…', async () => { const d = await saveDraft($('#vnote')?.value.trim()); track('version_saved', { draft: d.n, words: d.words }); toast(`Saved as Draft ${d.n}.`); }); break;
-    case 'scan': busy('Reading your manuscript and building the Story Bible…', scanBible); break;
-    case 'review': busy('Reviewing your manuscript for continuity…', runReview); break;
+    case 'scan': busy('Reading your manuscript and building the Glossary…', scanBible); break;
+    case 'review': busy('Reviewing grammar and checking your story for conflicts…', runReview); break;
     case 'add-char': S.bible.characters.push(normChar({ name: 'New character' })); render(); break;
     case 'add-plot': S.bible.plotlines.push(normPlot({ title: 'New plotline' })); render(); break;
     case 'del-char': S.bible.characters = S.bible.characters.filter((c) => c.id !== id); render(); break;
     case 'del-plot': S.bible.plotlines = S.bible.plotlines.filter((p) => p.id !== id); render(); break;
-    case 'save-bible': busy('Saving your Story Bible…', async () => { await commitBible($('#bnote')?.value.trim() || 'Edited by author', 'Author edit'); toast('Story Bible saved to history.'); }); break;
+    case 'save-bible': busy('Saving your Glossary…', async () => { await commitBible($('#bnote')?.value.trim() || 'Edited by author', 'Author edit'); toast('Glossary saved to history.'); }); break;
     case 'discard-bible': S.bible = JSON.parse(S.bibleSaved); render(); break;
     case 'mode': S.mode = id; render(); if (id === 'review' && S.sel) requestAnimationFrame(() => scrollToMark(S.sel)); break;
-    case 'cat': S.cat = id; S.sel = null; render(); if (S.mode === 'review' && S.sel) requestAnimationFrame(() => scrollToMark(S.sel)); break;
+    case 'cat': S.cat = id; S.sel = null; if (S.mode !== 'review' && (curReport() || S.gconf.items.length)) S.mode = 'review'; render(); if (S.sel) requestAnimationFrame(() => scrollToMark(S.sel)); break;
     case 'prev': case 'next': { const l = visibleFindings(), j = l.findIndex((x) => x.id === S.sel) + (a.dataset.act === 'next' ? 1 : -1); if (l[j]) select(l[j].id); break; }
     case 'pick': select(id); break;
     case 'goto-q': select(id, +a.dataset.k); break;
     case 'goto-ch': gotoChapter(+id); break;
     case 'resolved': S.showResolved = a.checked; render(); break;
-    case 'approve': busy('Saving…', () => setStatus(id, 'approved')); break;
+    case 'choose': busy('Updating your text…', () => chooseOption(id, +a.dataset.k)); break;
+    case 'resolve': busy('Saving…', () => setStatus(id, 'resolved')); break;
+    case 'undo-edit': case 'undo-last': {
+      const eid = a.dataset.act === 'undo-last' ? S.edits[0]?.id : id; if (!eid) break;
+      const ok = undoEdit(eid); saveWorking(true); toast(ok ? 'Change undone.' : 'Undone where possible: part of that text had been edited since.'); render(); break;
+    }
+    case 'go-gconf': S.cat = 'glossary'; S.mode = 'review'; S.sel = null; location.hash = '#manuscript'; break;
     case 'dismiss': busy('Saving…', () => setStatus(id, 'dismissed')); break;
     case 'reopen': busy('Saving…', () => setStatus(id, 'open')); break;
     case 'copy-report': copyReport(); break;
@@ -654,17 +1124,17 @@ document.addEventListener('click', (e) => {
     case 'cmp-bible': S.compare = { t: 'bible', id }; render(); window.scrollTo(0, 0); break;
     case 'close-compare': S.compare = null; render(); break;
     case 'open-draft': {
-      if (textDirty()) { toast('Save your current changes first (Manuscript tab).'); return; }
-      S.meta.currentDraftId = id; S.text = S.drafts.find((d) => d.id === id).text; S.mode = 'edit';
-      busy('Opening…', () => Store.set('meta', S.meta)); location.hash = '#manuscript'; break;
+      if (textDirty() && !S.confirmOpen) { S.confirmOpen = true; toast('Your edits since the last draft will be replaced. Click Open again to continue, or save a new draft first.'); setTimeout(() => (S.confirmOpen = false), 5000); return; }
+      S.confirmOpen = false; S.meta.currentDraftId = id; S.text = S.drafts.find((d) => d.id === id).text; S.edits = []; S.mode = 'edit';
+      busy('Opening…', async () => { await Store.set('meta', S.meta); await saveWorking(true); }); location.hash = '#manuscript'; break;
     }
     case 'restore-draft': busy('Restoring…', async () => { const d = S.drafts.find((x) => x.id === id); S.text = d.text; const nd = await saveDraft(`Restored from Draft ${d.n}`); toast(`Draft ${d.n} restored as Draft ${nd.n}.`); }); break;
-    case 'restore-bible': busy('Restoring…', async () => { const h = S.history.find((x) => x.id === id); S.bible = clone(h.snapshot); await commitBible(`Restored: ${h.note || h.source}`, 'Restore'); toast('Story Bible restored.'); }); break;
+    case 'restore-bible': busy('Restoring…', async () => { const h = S.history.find((x) => x.id === id); S.bible = clone(h.snapshot); await commitBible(`Restored: ${h.note || h.source}`, 'Restore'); toast('Glossary restored.'); }); break;
   }
 });
 document.addEventListener('input', (e) => {
   const t = e.target;
-  if (t.id === 'text') { S.text = t.value; const wc = $('#wc'); if (wc) wc.textContent = countWords(S.text).toLocaleString() + ' words'; updateSaveButton(); const dm = $('#dirty'); if (dm) dm.textContent = textDirty() ? ' · unsaved changes' : ''; return; }
+  if (t.id === 'text') { S.text = t.value; const wc = $('#wc'); if (wc) wc.textContent = countWords(S.text).toLocaleString() + ' words'; updateSaveButton(); updateLimit(); const dm = $('#dirty'); if (dm) dm.textContent = textDirty() && currentDraft() ? ' · edited since' : ''; saveWorking(); return; }
   if (t.id === 'title') { S.meta.title = t.value; clearTimeout(t._t); t._t = setTimeout(() => Store.set('meta', S.meta).catch(() => {}), 800); return; }
   const b = t.dataset.bind; if (!b) return;
   const [kind, id, f] = b.split(':');
@@ -673,7 +1143,6 @@ document.addEventListener('input', (e) => {
   updateBibleBar();
 });
 document.addEventListener('change', (e) => {
-  if (e.target.id === 'pick-report') { S.reportId = e.target.value; S.reportTab = 'summary'; render(); }
   if (e.target.dataset.bind) e.target.dispatchEvent(new Event('input', { bubbles: true }));
 });
 function updateSaveButton() {
@@ -687,21 +1156,38 @@ function updateBibleBar() {
   if (msg) { msg.textContent = dirty ? 'You have unsaved changes.' : 'All changes saved.'; msg.style.color = dirty ? 'var(--warn)' : 'var(--muted)'; }
 }
 async function copyReport() {
-  const r = S.reports[S.reportId]; if (!r) return;
-  const lines = [`Margins continuity report · ${S.meta.title || 'Untitled'} · Draft ${r.draftN} · ${when(r.createdAt)}`, ''];
-  for (const [k, l] of CATS) {
-    const fs = r.findings.filter((f) => f.category === k); if (!fs.length) continue;
+  const lines = [`Margins review · ${S.meta.title || 'Untitled'} · ${when(Date.now())}`, ''];
+  for (const [k, l] of TABS) {
+    const fs = tabItems(k); if (!fs.length) continue;
     lines.push(`== ${l} ==`);
-    for (const f of fs) lines.push(`[${f.status === 'open' ? 'OPEN' : f.status === 'approved' ? 'APPROVED' : 'NOT AN ISSUE'}] (${f.severity}) ${f.title}`, `  ${f.explanation}`, ...f.quotes.map((q) => `  "${q}"`), '');
+    for (const f of fs) {
+      const st = { open: 'OPEN', fixed: 'FIXED', resolved: 'RESOLVED', dismissed: 'NOT AN ISSUE' }[f.status] || f.status.toUpperCase();
+      lines.push(`[${st}] ${f.title}`, `  ${f.explanation}`);
+      if (f.fix) lines.push(`  "${f.fix.find}" → "${f.fix.replace}"`); else lines.push(...f.quotes.map((q) => `  "${q}"`));
+      if (f.options) lines.push(`  Options: ${f.options.map((o) => o.label).join(' / ')}`);
+      lines.push('');
+    }
   }
-  try { await navigator.clipboard.writeText(lines.join('\n')); toast('Report copied.'); } catch (_) { toast('Couldn’t copy. Select the text and copy it instead.'); }
+  try { await navigator.clipboard.writeText(lines.join('\n')); toast('Report copied.'); } catch (_) { toast('Couldn\u2019t copy. Select the text and copy it instead.'); }
 }
 $('#file').addEventListener('change', (e) => { const f = e.target.files[0]; e.target.value = ''; busy('Reading your file…', () => readFile(f)); });
 document.addEventListener('dragover', (e) => { if (e.target.closest('#drop')) { e.preventDefault(); $('#drop').classList.add('drag'); } });
 document.addEventListener('dragleave', (e) => { if (e.target.closest('#drop')) $('#drop').classList.remove('drag'); });
 document.addEventListener('drop', (e) => { const z = e.target.closest('#drop'); if (!z) return; e.preventDefault(); z.classList.remove('drag'); const f = e.dataTransfer.files[0]; if (f) busy('Reading your file…', () => readFile(f)); });
+document.addEventListener('submit', (e) => {
+  if (e.target.id !== 'signin-form') return;
+  e.preventDefault();
+  const v = $('#email').value.trim(), err = $('#email-err');
+  const bad = (m, el) => { err.textContent = m; err.hidden = false; el.focus(); };
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v)) return bad('Please enter a valid email address.', $('#email'));
+  if (!$('#pw')) { busy('Opening your workspace…', () => signIn(v)); return; }
+  const pw = $('#pw').value;
+  if (pw.length < 6) return bad('Please use a password with at least 6 characters.', $('#pw'));
+  S.prefill = v;
+  busy(S.createMode ? 'Creating your account…' : 'Signing in…', () => signIn(v, pw, !!S.createMode));
+});
 window.addEventListener('hashchange', () => { S.compare = null; S.error = ''; render(); window.scrollTo(0, 0); });
-window.addEventListener('beforeunload', (e) => { if (textDirty() || bibleDirty()) { e.preventDefault(); e.returnValue = ''; } });
+window.addEventListener('beforeunload', (e) => { if (bibleDirty()) { e.preventDefault(); e.returnValue = ''; } });
 
 render();
 load();
